@@ -2,6 +2,19 @@
 
 本教程面向第一次使用 `coreldraw-x8-redraw` 技能的人，从环境准备到跑出第一个重绘文件。
 
+技能支持四种输入模式，本教程按难度依次介绍：
+
+| 章节 | 模式 | 适用场景 |
+| --- | --- | --- |
+| 二、三 | 源 CDR | 手上有原始 `.cdr` |
+| 四 | 图片 + 尺寸 | 截图/草图 + 书面尺寸 |
+| 五 | PDF 派生 | 只有 PDF，没有源 CDR |
+| **六** | **位图矢量化** | **只有位图，要"照着画进 CDR"** |
+
+> 第六节是新加的，也是踩坑最多的一节。它对应三个脚本
+> （`cdr_image_trace.py` / `cdr_image_place.py` / `cdr_visual_diff.py`）
+> 和一份实战笔记 `references/raster-to-vector-notes.md`。
+
 ---
 
 ## 一、准备环境
@@ -20,11 +33,17 @@
 >
 > 遇到这两个错误，第一反应就应该是"我装的是不是精简版"。
 
-### 2. 安装 Python 与 pywin32
+### 2. 安装 Python 与依赖
 
 ```powershell
 python --version          # 需要 3.10 或更高
 python -m pip install pywin32
+```
+
+如果要用**位图矢量化模式**（第六节），再装四个：
+
+```powershell
+python -m pip install numpy opencv-python pillow potracer
 ```
 
 ### 3. 验证 COM 通路
