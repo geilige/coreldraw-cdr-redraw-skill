@@ -219,19 +219,29 @@ python scripts\cdr_text_live.py --image 源图.png ^
     --region footer=0,17,0,372 --mm-per-px 0.17256 --out-dir out\text
 ```
 
-产出 `live_text.json`（含逐区文本、选定字体、IoU、lift、判定）、
+加 `--apply out\live.cdr` 才真的在 CorelDRAW 里建活字（建在 `<区名>_LIVE` 图层）。
+
+产出 `live_text.json`（含逐区文本、选定字体、IoU、lift、**四条判据的取值**、判定）、
 `font_match_<区>.json`、`compare_<区>.png` 三联对照图。
 
 **但默认不自动替换描摹轮廓**——字体猜错比描摹失真更糟。必须看 `verdict`：
-`keep_trace` 就保留轮廓，并在报告里列出库里最接近的候选让用户决定。
 
-三个关键设计点（详见 `references/live-text-design.md`）：
+- `keep_trace` + `reject_kind=weak_match` → 保留轮廓，报告里列出库里最接近的候选；
+- `keep_trace` + `reject_kind=not_text` → **这块根本不是一行文字**，该去查区域切分。
+
+四个关键设计点（详见 `references/live-text-design.md`）：
 
 1. **OCR 要跑多套预处理投票**。实测同一张图，2×+20px 留白出乱码、
    2×+纵向 0 留白出正确答案——**没有一套参数对所有图都稳**。
-2. **判定不能用绝对 IoU 门槛**。16px 小字即使文本与字体都对，IoU 也只有 0.61；
+2. **相似度不能用绝对 IoU 门槛**。16px 小字即使文本与字体都对，IoU 也只有 0.61；
    用 0.62 的绝对门槛会把完美匹配也拒掉。改用 `lift = 最佳 ÷ 候选中位`（与字号无关）。
-3. **易混符号直接量字形**（`•` 宽高比 1.25/密度 0.80 vs `-` 宽高比 4.00），
+3. **但光有相似度不够，必须补"这是不是文字"的硬门槛**。实测把工具插图区
+   当文字区喂进来，OCR 幻觉出 `'wander'`，lift 1.53、IoU 0.386 **两个相似度判据
+   全过**，于是在 CDR 里建了一行 `'wander'`。根因：lift 与 IoU 都在"横向拉伸到
+   同宽"**之后**算，而拉伸本身就把最大的差异抹掉了。补两条与字号无关的比值：
+   **分量数÷字符数**（真文字 1.10 / 误判区 11.00）与**自然宽度比**
+   （真文字 0.987 / 误判区 1.887），两条都过才允许转。
+4. **易混符号直接量字形**（`•` 宽高比 1.25/密度 0.80 vs `-` 宽高比 4.00），
    大小写改动才走整体 IoU 逐词裁决——因为单个窄字形只占整行约 1% 面积，
    全局 IoU 分不出来。
 
@@ -464,11 +474,19 @@ python scripts\cdr_text_live.py --image ref.png ^
   --region footer=0,17,0,372 --mm-per-px 0.17256 --out-dir out\text
 python scripts\cdr_text_live.py --image ref.png --region "t:0,20,0,400" ^
   --mm-per-px 0.17256 --out-dir out\text --corel-only
+python scripts\cdr_text_live.py --image ref.png ^
+  --region footer=0,17,0,372 --mm-per-px 0.17256 --out-dir out\text ^
+  --apply out\live.cdr            # 真的建活字（建在 footer_LIVE 图层）
 ```
 
-产出 `live_text.json`（逐区文本 / 选定字体 / IoU / lift / 判定）、
+产出 `live_text.json`（逐区文本 / 选定字体 / IoU / lift / **四条判据取值** / 判定）、
 `font_match_<区>.json`、`compare_<区>.png` 三联对照图。
-**`verdict` 为 `keep_trace` 时不要转**，保留描摹轮廓并在报告里说明。
+**`verdict` 为 `keep_trace` 时不要转**，保留描摹轮廓并在报告里说明；
+同时看 `reject_kind` 区分是"库里没有接近的"（`weak_match`）
+还是"这块根本不是文字"（`not_text`，该去查区域切分）。
+
+活字**单独放 `<区名>_LIVE` 图层**，与描摹轮廓分层——万一字体猜错，
+用户能一眼看出是哪一层、整层删掉，不污染描摹结果。
 
 ### CDR 剖析与重建
 
@@ -484,7 +502,7 @@ python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cd
 ```text
 python -m pip install numpy opencv-python pillow potracer
 python -m pip install pywin32          # 只有要建 CDR 时才需要
-python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线回归测试（66 项断言）
+python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线回归测试（95 项断言）
 ```
 
 文字转活字另需 OCR（离线，无需联网）：
@@ -500,12 +518,15 @@ Windows 上 `onnxruntime` 还缺 `vcruntime140_1.dll` 与 `msvcp140_1.dll`
 （前者 Python 安装目录自带），缺了会报 `DLL load failed`。
 用 `pefile` 查 `.pyd` 的导入表能直接看出缺哪个。详见 `references/live-text-design.md`。
 
-`selftest_offline.py` 覆盖两块：纯逻辑（提示词渲染、CDR 结构比对），以及
-**用一张几何已知的合成图**验证自动分区的每一处坑——残留剥离、外沿外扩、
-满版色带贯通判据、行中位数、列方向切分、超采样度量的偏差量级。
-改动 `auto_partition` / `strip_residue` / `_tighten` / `rasterize` 之后
-**必须重跑它**，这些函数的错误在真实图上往往只表现为"某块内容描歪了"，
-肉眼很难定位。
+`selftest_offline.py` 覆盖三块：纯逻辑（提示词渲染、CDR 结构比对）；
+**用一张几何已知的合成图**验证自动分区的每一处坑（残留剥离、外沿外扩、
+满版色带贯通判据、行中位数、列方向切分、超采样度量的偏差量级）；
+以及文字转活字的判定（连通分量、文字/线稿的统计特征、四条判据的边界，
+夹具用的是**实测值**而不是编的数）。
+
+改动 `auto_partition` / `strip_residue` / `_tighten` / `rasterize` /
+`cc_sizes` / `decide_convert` 之后**必须重跑它**——这些函数的错误在真实图上
+往往只表现为"某块内容描歪了""多了一行不该有的文字"，肉眼很难定位。
 
 ## 参考文档
 
@@ -516,6 +537,7 @@ Windows 上 `onnxruntime` 还缺 `vcruntime140_1.dll` 与 `msvcp140_1.dll`
   （含一次判断错误的自我纠错记录）。
 - `references/live-text-design.md`：**文字转活字必读**。OCR 多套预处理投票、
   列投影切词、字形级纠错、字体匹配打分、为什么不能用绝对 IoU 判定、
+  **为什么必须补"这是不是文字"的硬门槛**（含把插图区误判成 `'wander'` 的完整反例）、
   CDR 侧字号与宽度分开解、依赖安装的两个坑、适用边界与已知限制。
 - `references/coreldraw-object-model.md`：CorelDRAW X8 COM 对象模型、枚举与跨文档复制要点。
 - `references/prompt-template.md`：定制提示词的完整模板与骨架。

@@ -106,7 +106,7 @@ python skills\coreldraw-x8-redraw\scripts\cdr_bitmap_to_cdr.py ^
 | 易碎标 | 152.539,59.532..194.988,75.924 | 152.474,59.596..195.074,75.924 |
 | 页脚 | 81.274,186.878..145.292,189.121 | 81.252,186.921..145.249,189.703 |
 
-这套判据有**离线回归测试**（`scripts/selftest_offline.py`，66 项断言，不需要
+这套判据有**离线回归测试**（`scripts/selftest_offline.py`，95 项断言，不需要
 CorelDRAW）：用一张几何已知的合成图覆盖残留剥离、外沿外扩、贯通判据、
 行中位数、列切分、超采样度量等每一处坑，改坏了立刻报出来。
 
@@ -186,18 +186,45 @@ X8 内置 PowerTRACE 的宏接口**能跑**，但质量差一个量级，所以�
 python skills\coreldraw-x8-redraw\scripts\cdr_text_live.py ^
   --image ref.png --region footer=0,17,0,372 ^
   --mm-per-px 0.17256 --out-dir out\text
+
+# 加 --apply 才真的在 CorelDRAW 里建活字（建在 footer_LIVE 图层）
+python skills\coreldraw-x8-redraw\scripts\cdr_text_live.py ^
+  --image ref.png --region footer=0,17,0,372 ^
+  --mm-per-px 0.17256 --out-dir out\text --apply out\live.cdr
 ```
 
 **但默认不自动替换描摹轮廓**——字体猜错比描摹失真更糟。必须看产出的 `verdict`：
-`keep_trace` 就保留轮廓，并在报告里列出库里最接近的候选让用户决定。
 
-三个关键设计点：
+| `verdict` | `reject_kind` | 含义与处置 |
+| --- | --- | --- |
+| `convert` | — | 可以转。报告里写明字体与分数，并注明"字体是形状匹配推断，非源文件信息" |
+| `keep_trace` | `weak_match` | 是文字，但库里没有够接近的。保留描摹轮廓，列出最接近的候选 |
+| `keep_trace` | `not_text` | **这块根本不是一行文字**，该去查区域切分 |
+
+活字**单独放 `<区名>_LIVE` 图层**，与描摹轮廓分层——万一猜错，用户能一眼看出
+是哪一层、整层删掉即可。
+
+四个关键设计点：
 
 1. **OCR 要跑多套预处理投票**。实测同一张图，`2× + 20px 四周留白`出乱码、
    `2× + 纵向 0 留白`出正确答案——没有一套参数对所有图都稳。
-2. **判定不能用绝对 IoU 门槛**。16px 小字即使文本与字体都对，IoU 也只有 0.61；
+2. **相似度不能用绝对 IoU 门槛**。16px 小字即使文本与字体都对，IoU 也只有 0.61；
    用 0.62 的绝对门槛会把完美匹配也拒掉。改用 `lift = 最佳 ÷ 候选中位`（与字号无关）。
-3. **易混符号直接量字形**（`•` 宽高比 1.25 / 墨密度 0.80，`-` 宽高比 4.00），
+3. **但光有相似度不够，必须补"这是不是文字"的硬门槛**。这一条是踩坑踩出来的：
+   把工具插图区当文字区喂进来时，OCR 幻觉出 `'wander'`（6 个字），
+   `lift = 1.53`、`IoU = 0.386` —— **两个相似度判据全过**，于是在 CDR 里
+   建了一行 `'wander'`。根因是 lift 与 IoU 都在"横向拉伸到同宽"**之后**算，
+   而拉伸本身就把最大的差异抹掉了。补两条与字号无关的比值当硬门槛：
+
+   | 判据 | 真页脚实测 | 插图误判区实测 |
+   | --- | --- | --- |
+   | 连通分量数 ÷ 字符数 | **1.10** | **11.00** |
+   | 最佳候选的自然宽度比 | **0.987** | **1.887** |
+
+   两条都过才允许转。它们**互补**：短幻觉靠前者抓（比值被抬高），
+   长幻觉靠后者抓（自然宽度远大于源宽度）。
+
+4. **易混符号直接量字形**（`•` 宽高比 1.25 / 墨密度 0.80，`-` 宽高比 4.00），
    大小写改动才走整体 IoU 逐词裁决——单个窄字形只占整行约 1% 面积，全局 IoU 分不出来。
 
 详见 `skills/coreldraw-x8-redraw/references/live-text-design.md`。
@@ -299,7 +326,7 @@ python skills\coreldraw-x8-redraw\scripts\cdr_redraw.py ^
   --source input.cdr --output outputs\redraw_exact.cdr --mode clone
 ```
 
-**离线回归测试**（不需要 CorelDRAW，66 项断言）：
+**离线回归测试**（不需要 CorelDRAW，95 项断言）：
 
 ```powershell
 python skills\coreldraw-x8-redraw\scripts\selftest_offline.py
@@ -323,7 +350,7 @@ skills/coreldraw-x8-redraw/
 │   ├── cdr_prompt_builder.py         生成文件专属重绘提示词
 │   ├── cdr_redraw.py                 形状级精确重建与结构校验
 │   ├── cdr_common.py                 COM 连接、重试、遍历、统计
-│   └── selftest_offline.py           离线回归测试（66 项断言，含自动分区合成图）
+│   └── selftest_offline.py           离线回归测试（95 项断言，含自动分区合成图、活字判定）
 └── references/
     ├── raster-to-vector-notes.md     ★ 位图矢量化必读（实测踩坑结论）
     │                                 §9 = 内置 PowerTRACE 完整实测

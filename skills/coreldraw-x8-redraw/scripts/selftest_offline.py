@@ -12,6 +12,12 @@ B. 自动分区与度量（用**合成图**，有已知真值）
    - auto_partition    行中位数判色带 / 色带横向用未剥离墨迹 / 列方向切分
    - rasterize         超采样覆盖率（对比硬边填充的系统性偏差）
 
+C. 文字转活字的判定（纯逻辑，不需要 OCR、不需要 CorelDRAW）
+   - cc_sizes          连通分量（8 邻域 / 行程并查集 / 碎点过滤）
+   - glyph_stats       文字与线稿的统计特征
+   - decide_convert    四条判据，**用实测的两个案例当夹具**
+                       （真页脚 n_cc=53/n_char=48；把插图区当文字区 n_cc=66/n_char=6）
+
 合成图是刻意设计的，每一处都对应一个真实踩过的坑：
 左侧 4 列 + 顶部 3 行贯穿残留、满版色带被反白字掏空、同一行两个内容块、
 细笔画文字带一圈比二值化阈值更浅的抗锯齿外沿。
@@ -56,6 +62,7 @@ import cdr_prompt_builder                                 # noqa: E402
 import cdr_redraw                                         # noqa: E402
 import cdr_image_trace as T                               # noqa: E402
 import cdr_bitmap_to_cdr as B                             # noqa: E402
+import cdr_text_live as L                                 # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +437,142 @@ def test_shim_source(tmpdir):
 
 
 # ---------------------------------------------------------------------------
+# C. 文字转活字的判定
+# ---------------------------------------------------------------------------
+
+def test_cc_sizes():
+    """连通分量：8 邻域、行程并查集、碎点过滤。
+
+    8 邻域这个选择不是随意的：小字号下 'i' 的点与杆经常只对角相接，
+    用 4 邻域会把一个字形数成两个，直接把"分量数/字符数"判据顶穿。
+    """
+    check("空图返回空列表", L.cc_sizes(np.zeros((10, 20), bool)) == [])
+
+    m = np.zeros((10, 20), bool)
+    m[1:4, 1:4] = True
+    m[1:4, 10:13] = True
+    check("两个分离方块 → 2 个分量", L.cc_sizes(m) == [9, 9], str(L.cc_sizes(m)))
+
+    d = np.zeros((10, 10), bool)
+    d[1, 1] = True
+    d[2, 2] = True
+    check("对角相接算连通（8 邻域；4 邻域会数成 2 个）",
+          len(L.cc_sizes(d)) == 1, str(L.cc_sizes(d)))
+
+    # 同一行两个行程被下一行的一个行程连起来：必须并成一个
+    u = np.zeros((4, 12), bool)
+    u[0, 1:3] = True
+    u[0, 6:8] = True
+    u[1, 2:7] = True
+    check("跨行的多个行程并成一个分量", L.cc_sizes(u) == [2 + 2 + 5],
+          str(L.cc_sizes(u)))
+
+    s = np.zeros((10, 10), bool)
+    s[1:4, 1:4] = True
+    s[8, 8] = True
+    check("1px 碎点被默认 min_px=2 滤掉", L.cc_sizes(s) == [9], str(L.cc_sizes(s)))
+    check("min_px=1 时碎点保留", len(L.cc_sizes(s, min_px=1)) == 2,
+          str(L.cc_sizes(s, min_px=1)))
+
+
+def test_glyph_stats():
+    """文字与线稿的统计特征差在哪——用合成图把方向钉死。"""
+    # 文字样：20 个同样大小的竖条，间距均匀
+    txt = np.zeros((20, 240), bool)
+    for k in range(20):
+        txt[4:16, 4 + k * 11:8 + k * 11] = True
+    g1 = L.glyph_stats(txt)
+    check("文字样：分量数 = 字形数", g1["n_cc"] == 20, str(g1["n_cc"]))
+    check("文字样：最大/中位 = 1（字形大小均匀）",
+          near(g1["cc_max_over_median"], 1.0, 0.01), str(g1["cc_max_over_median"]))
+
+    # 线稿样：一大块实心 + 几个小碎块
+    art = np.zeros((60, 200), bool)
+    art[5:55, 5:60] = True
+    for k in range(8):
+        art[10:14, 80 + k * 12:88 + k * 12] = True
+    g2 = L.glyph_stats(art)
+    check("线稿样：最大/中位 远大于文字样",
+          g2["cc_max_over_median"] > 20, str(g2["cc_max_over_median"]))
+    check("线稿样的尺寸离散度也远大于文字样",
+          g2["cc_size_cv"] > g1["cc_size_cv"] * 3,
+          f'{g2["cc_size_cv"]:.3f} vs {g1["cc_size_cv"]:.3f}')
+
+    check("空图不崩", L.glyph_stats(np.zeros((5, 5), bool))["n_cc"] == 0)
+
+
+def test_decide_convert():
+    """四条判据。夹具是**实测值**，不是编的数：
+
+        页脚（真文字，应转）  n_cc=53  n_char=48  wr=0.987  iou=0.7244  lift=2.675
+        插图（非文字，应拒）  n_cc=66  n_char=6   wr=1.887  iou=0.3859  lift=1.531
+
+    第二行就是修复前的真 bug：C 判据没过，但 D 判据（lift 1.531 > 1.25 且
+    iou 0.3859 > 0.35）全过，于是在 CDR 里建了一行 'wander'。
+    """
+    FOOTER = dict(final_iou=0.7244, lift=2.675, width_ratio=0.987,
+                  n_cc=53, n_char=48)
+    ART = dict(final_iou=0.3859, lift=1.531, width_ratio=1.887,
+               n_cc=66, n_char=6)
+
+    d = L.decide_convert(**FOOTER)
+    check("真文字判 convert", d["verdict"] == "convert", str(d["reasons"]))
+    check("真文字四条判据全过",
+          all(c["ok"] for c in d["checks"].values()), str(d["checks"]))
+    check("convert 时没有拒绝理由、没有 reject_kind",
+          d["reasons"] == [] and d["reject_kind"] is None, str(d))
+
+    d = L.decide_convert(**ART)
+    check("非文字区判 keep_trace（修复前是 convert）",
+          d["verdict"] == "keep_trace", str(d["checks"]))
+    check("非文字区归为 not_text", d["reject_kind"] == "not_text",
+          str(d["reject_kind"]))
+    check("非文字区同时触发**两条**独立理由（分量比 + 宽度比）",
+          len(d["reasons"]) == 2, str(d["reasons"]))
+
+    # 把两条硬门槛放开，这个案例就会被放过——证明"拦住的正是这两条"
+    old = L.decide_convert(**ART, max_cc_per_char=1e9, max_wr=1e9)
+    check("放开两条硬门槛后非文字区确实会被放过（说明门槛真在起作用）",
+          old["verdict"] == "convert", str(old["checks"]))
+    check("且此时只剩相似度判据在管（D 过、C 不过）",
+          old["checks"]["abs_iou"]["ok"] is False
+          and old["checks"]["rel_lift"]["ok"] is True, str(old["checks"]))
+
+    # 边界
+    check("cc/字符 正好 4.0 通过",
+          L.decide_convert(0.9, 2.0, 1.0, 40, 10)["checks"]["cc_per_char"]["ok"])
+    check("cc/字符 4.1 不通过",
+          not L.decide_convert(0.9, 2.0, 1.0, 41, 10)["checks"]["cc_per_char"]["ok"])
+    check("宽度比 1.50 通过",
+          L.decide_convert(0.9, 2.0, 1.50, 40, 20)["checks"]["width_ratio"]["ok"])
+    check("宽度比 1.51 不通过",
+          not L.decide_convert(0.9, 2.0, 1.51, 40, 20)["checks"]["width_ratio"]["ok"])
+    check("宽度比 0.65 通过",
+          L.decide_convert(0.9, 2.0, 0.65, 40, 20)["checks"]["width_ratio"]["ok"])
+    check("宽度比 0.64 不通过",
+          not L.decide_convert(0.9, 2.0, 0.64, 40, 20)["checks"]["width_ratio"]["ok"])
+
+    # 像文字、几何也合理，但字体库里没有够接近的 → 该保留描摹轮廓
+    d = L.decide_convert(0.30, 1.05, 1.0, 20, 12)
+    check("像文字但字体都不像 → keep_trace 且归为 weak_match",
+          d["verdict"] == "keep_trace" and d["reject_kind"] == "weak_match",
+          str(d))
+    check("weak_match 的理由只提相似度（不冤枉成 not_text）",
+          len(d["reasons"]) == 1 and "相似度不足" in d["reasons"][0],
+          str(d["reasons"]))
+
+    # 大字号：绝对 IoU 单独就该放行（不依赖 lift）
+    d = L.decide_convert(0.95, 1.02, 1.0, 30, 25)
+    check("大字号靠绝对 IoU 放行（lift 只有 1.02）",
+          d["verdict"] == "convert", str(d["checks"]))
+
+    # 字符数为 0 不能除零
+    d = L.decide_convert(0.9, 2.0, 1.0, 0, 0)
+    check("字符数为 0 不崩（按 1 算，比值 0 落在下限外 → 拒绝）",
+          d["verdict"] == "keep_trace", str(d["checks"]))
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
@@ -454,6 +597,13 @@ def main():
         test_shim_source(tmpdir)
     print()
     test_pick_thresholds()
+
+    print("\n=== C. 文字转活字的判定（纯逻辑）===")
+    test_cc_sizes()
+    print()
+    test_glyph_stats()
+    print()
+    test_decide_convert()
 
     print()
     if _FAILED:

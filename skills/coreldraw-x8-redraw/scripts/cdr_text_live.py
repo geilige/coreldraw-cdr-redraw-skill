@@ -17,7 +17,12 @@
   4. 字形级纠错：按字符高度定大小写、按墨量定 ·/• 之类易混符号
   5. 字体匹配：把系统字体逐个渲染同串文本，按高度归一后比 IoU
   6. 解字号（决定高度）与横向缩放（决定宽度），两者分开解
-  7. 把候选渲染回位图，与源算 IoU；**低于阈值就不转**，保留描摹轮廓
+  7. 判定，**四条判据缺一不可**（`decide_convert`）：
+       硬门槛 A：连通分量数 ÷ 字符数 —— 这块到底是不是一行文字
+       硬门槛 B：最佳候选的自然宽度比 —— 有没有字体的字宽与它相符
+       相似度 C：重建 IoU 绝对值（适合大字号）
+       相似度 D：领先候选集中位的倍数（与字号无关，适合小字）
+     C 或 D 过即可，但 A 与 B 必须都过；否则保留描摹轮廓，不转
   8. --apply 时才真的在 CorelDRAW 里建文本
 
 产出
@@ -422,6 +427,180 @@ def match_fonts(src_mask, text, corel_fonts=None, top=12):
 
 
 # --------------------------------------------------------------------------
+# 判定：这块墨迹到底是不是"一行文字"
+# --------------------------------------------------------------------------
+
+def cc_sizes(mask, min_px=2):
+    """8 邻域连通分量的**尺寸列表**（降序）。用行程 + 并查集，不逐像素 DFS。
+
+    为什么不调 cv2.connectedComponents：本脚本的位图侧刻意只依赖 numpy + PIL
+    （重依赖只有 OCR 那一半），这样在没有装 opencv 的机器上字体匹配仍能跑。
+    行程并查集在文字这种"行程数远少于像素数"的图上比逐像素扫描快得多
+    （一行文字 16 行、每行几十个行程，而像素有六千个）。
+
+    min_px 过滤掉抗锯齿产生的碎点，否则分量数会被噪声抬高。
+    """
+    h, w = mask.shape
+    if not mask.any():
+        return []
+    runs = []           # [y, x0, x1)
+    row_idx = []        # 每行的行程下标
+    for y in range(h):
+        row = mask[y]
+        idx, x = [], 0
+        while x < w:
+            if row[x]:
+                x0 = x
+                while x < w and row[x]:
+                    x += 1
+                idx.append(len(runs))
+                runs.append([y, x0, x])
+            else:
+                x += 1
+        row_idx.append(idx)
+
+    parent = list(range(len(runs)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for y in range(1, h):
+        prev, cur = row_idx[y - 1], row_idx[y]
+        i = j = 0
+        while i < len(prev) and j < len(cur):
+            _, py0, py1 = runs[prev[i]]
+            _, cy0, cy1 = runs[cur[j]]
+            # 8 邻域：两个列区间只要相交或仅隔 1 列就算连通
+            if py0 <= cy1 and cy0 <= py1:
+                ra, rb = find(prev[i]), find(cur[j])
+                if ra != rb:
+                    parent[max(ra, rb)] = min(ra, rb)
+            if py1 <= cy1:
+                i += 1
+            else:
+                j += 1
+
+    agg = {}
+    for k, (_, x0, x1) in enumerate(runs):
+        r = find(k)
+        agg[r] = agg.get(r, 0) + (x1 - x0)
+    return sorted((s for s in agg.values() if s >= min_px), reverse=True)
+
+
+def glyph_stats(core):
+    """量这块墨迹"像不像一行文字"——只用几何，不看 OCR 文本。
+
+    实测（同一批真实区域，`references/live-text-design.md` §1.6b 有完整表）：
+
+        区域             分量  中位   最大    max/med  填墨率  尺寸CV
+        text01(真文字)    53   32     63      1.97     0.285   0.582
+        mark01(字标)      21  328   5803     17.69     0.463   2.326
+        art01(插图)       66   20.5 19800   965.85     0.368   2.951
+
+    真文字这一行的特征很清楚：分量多、**大小均匀**（max/med 约 2）、
+    填墨率低（笔画细）。线稿正相反。这里只负责把统计量算出来，
+    要不要据此拒绝交给 decide_convert（阈值必须可调、且必须记进产物里）。
+    """
+    sizes = cc_sizes(core)
+    if not sizes:
+        return {'n_cc': 0, 'cc_median_px': 0.0, 'cc_max_px': 0,
+                'cc_max_over_median': 0.0, 'ink_fill': 0.0, 'cc_size_cv': 0.0}
+    arr = np.asarray(sizes, float)
+    med = float(np.median(arr))
+    return {
+        'n_cc': len(sizes),
+        'cc_median_px': round(med, 1),
+        'cc_max_px': int(sizes[0]),
+        'cc_max_over_median': round(sizes[0] / med, 2) if med else 0.0,
+        'ink_fill': round(float(core.sum()) / core.size, 4),
+        'cc_size_cv': round(float(arr.std() / (arr.mean() or 1)), 4),
+    }
+
+
+def decide_convert(final_iou, lift, width_ratio, n_cc, n_char,
+                   min_iou=0.72, min_lift=1.25, min_iou_floor=0.35,
+                   min_wr=0.65, max_wr=1.50,
+                   min_cc_per_char=0.25, max_cc_per_char=4.0):
+    """这一块到底该不该转成活字。返回 verdict + 每条判据的取值 + 拒绝理由。
+
+    四条判据。**前两条是硬门槛**（"这到底是不是一行文字"），后两条是相似度
+    （"像不像这个字体"），后两条满足其一即可：
+
+      A. 分量数 / 字符数      必须落在 [min_cc_per_char, max_cc_per_char]
+      B. 最佳候选的自然宽度比  必须落在 [min_wr, max_wr]
+      C. 绝对 IoU >= min_iou
+      D. lift >= min_lift 且 final_iou >= min_iou_floor
+
+    **为什么 A、B 可以用绝对区间，而相似度不能**：
+      IoU 的可达上限随字号退化——实测 16px 高的页脚，即使用完全正确的字体
+      与完全正确的文本，IoU 也只有 0.61；用 0.62 的绝对门槛会把完美匹配也
+      拒掉。所以相似度只能比"相对候选集中位的提升倍数"。而 A 与 B 都是
+      **与字号无关的比值**：A 的期望值恒为 1（一个字形一个分量），
+      B 的期望值也恒为 1（字体的自然字宽就是源宽度），所以绝对区间不仅
+      合理，而且是唯一稳的判据。
+
+    **为什么 A、B 必须是硬门槛（不能像 C/D 那样"满足其一"）**：
+      它们是"这块东西是不是文字"的前提。前提不成立时，C、D 算出来的高分
+      是**拉伸出来的假象**——B 的分子（渲染宽度）正是靠横向拉伸才对齐的，
+      而拉伸这一步本身就把最大的差异抹掉了。实测反例：把工具插图区当文字区
+      喂进来，OCR 幻觉出 'wander'（6 字），最佳候选 Impact 的
+      wr=1.887、rebuild_iou=0.386、lift=1.531 —— C 不过，D 却全过
+      （1.531>1.25、0.386>0.35），于是判定 convert，真的在 CDR 里建了
+      一行 'wander'。而 A 一眼看穿：那块图有 66 个连通分量，OCR 却说
+      只有 6 个字，比值 11.0（真页脚是 1.10，差 10 倍）。
+
+    **A 与 B 互补**，这是它们能一起用住的原因：
+      短幻觉（几个字盖住复杂图形）→ A 抓到，比值偏大；
+      长幻觉（长串盖住简单图形）  → B 抓到，自然宽度远大于源宽度。
+    """
+    nch = max(int(n_char), 1)
+    ccr = float(n_cc) / nch
+    checks = {
+        'cc_per_char': {'value': round(ccr, 3), 'min': min_cc_per_char,
+                        'max': max_cc_per_char, 'n_cc': int(n_cc),
+                        'n_char': int(n_char),
+                        'ok': min_cc_per_char <= ccr <= max_cc_per_char},
+        'width_ratio': {'value': round(width_ratio, 3), 'min': min_wr,
+                        'max': max_wr,
+                        'ok': min_wr <= width_ratio <= max_wr},
+        'abs_iou': {'value': round(final_iou, 4), 'min': min_iou,
+                    'ok': final_iou >= min_iou},
+        'rel_lift': {'value': round(lift, 3), 'min': min_lift,
+                     'floor': min_iou_floor,
+                     'ok': (lift >= min_lift and final_iou >= min_iou_floor)},
+    }
+    reasons = []
+    if not checks['cc_per_char']['ok']:
+        reasons.append('分量数/字符数 %.2f 超出 [%.2f, %.2f]——%d 个连通分量'
+                       '对 %d 个字符，这不像一行文字'
+                       % (ccr, min_cc_per_char, max_cc_per_char, n_cc, n_char))
+    if not checks['width_ratio']['ok']:
+        reasons.append('最佳字体的自然宽度比 %.3f 超出 [%.2f, %.2f]——没有哪个'
+                       '字体的自然字宽与这块区域的宽高比相符'
+                       % (width_ratio, min_wr, max_wr))
+    gate_ok = checks['cc_per_char']['ok'] and checks['width_ratio']['ok']
+    sim_ok = checks['abs_iou']['ok'] or checks['rel_lift']['ok']
+    if gate_ok and not sim_ok:
+        reasons.append('相似度不足（IoU %.4f < %.2f，且领先候选集中位仅 '
+                       '%.2f× < %.2f）'
+                       % (final_iou, min_iou, lift, min_lift))
+    verdict = 'convert' if (gate_ok and sim_ok) else 'keep_trace'
+    return {
+        'verdict': verdict,
+        'checks': checks,
+        'reasons': [] if verdict == 'convert' else reasons,
+        # 两类拒绝要分开：not_text 是"这根本不是文字"，weak_match 是
+        # "像文字但字体库里没有足够接近的"。处置方式不同——
+        # 前者该去查区域切分，后者只能保留描摹轮廓。
+        'reject_kind': (None if verdict == 'convert'
+                        else ('not_text' if not gate_ok else 'weak_match')),
+    }
+
+
+# --------------------------------------------------------------------------
 # CorelDRAW 侧
 # --------------------------------------------------------------------------
 
@@ -475,6 +654,215 @@ def solve_size_and_width(shp, target_h_mm, target_w_mm, app, lo=4.0, hi=40.0):
             'width_mm_before': round(w, 4), 'x_scale': round(scale, 5)}
 
 
+def _hex_to_rgb(s):
+    s = s.lstrip('#')
+    return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _get_layer(page, name, reuse_first=True):
+    """取名为 name 的图层；没有就新建。
+
+    注意 `CreateLayer` 挂在 **Page** 上，不在 `Layers` 集合上——
+    `page.Layers.CreateLayer(...)` 会报 `IVGLayers object has no attribute`。
+    集合本身只有 Item / Count / Find / Top / Bottom。
+    """
+    for i in range(1, page.Layers.Count + 1):
+        lay = page.Layers.Item(i)
+        if str(lay.Name) == name:
+            return lay
+    if reuse_first and page.Layers.Count == 1:
+        lay = page.Layers.Item(1)
+        # 只复用**默认名**的图层（"图层 1" / "Layer 1"）。
+        # 否则多个区域会反复改名，把上一个区域刚建好的图层名覆盖掉。
+        nm = str(lay.Name)
+        if nm.startswith('图层') or nm.lower().startswith('layer'):
+            lay.Name = name
+            return lay
+    return page.CreateLayer(name)
+
+
+def apply_region(app, page, rec, mm_per_px, layer_suffix, rgb, log=print):
+    """把一条判定为 convert 的记录真的建成活字，并回读校验定位误差。
+
+    坐标约定：`doc.ReferencePoint = 3`（cdrTopLeft）时，`PositionX/Y` 就是
+    形状包围盒的左上角；而 CorelDRAW 的 y 轴向上、原点在页面左下，
+    所以目标"距页顶 y_top"要写成 `page_h - y_top`。
+
+    建完必须**回读包围盒再校正**：`Stretch` 之后位置会漂，
+    只设一次坐标不校验的话误差能到零点几毫米。
+    """
+    page_h = float(page.SizeHeight)
+    box = rec['source_box_px']
+    x_mm = box[0] * mm_per_px
+    y_top_mm = box[1] * mm_per_px
+    tgt_w, tgt_h = rec['size_mm']
+    tgt_y = page_h - y_top_mm
+
+    lay = _get_layer(page, rec['region'] + layer_suffix)
+    shp = lay.CreateArtisticText(x_mm, tgt_y, rec['text'])
+    if shp is None:
+        return {'ok': False, 'error': 'CreateArtisticText 返回空'}
+
+    # 字体名要用 family 名（不是文件名）
+    fam = rec['font']['family']
+    try:
+        shp.Text.Story.Font = fam
+    except Exception as e:
+        return {'ok': False, 'error': '设置字体 %r 失败: %s' % (fam, e)}
+
+    info = solve_size_and_width(shp, tgt_h, tgt_w, app)
+    if not info:
+        return {'ok': False, 'error': '字号求解失败'}
+    try:
+        shp.Stretch(info['x_scale'], 1.0)
+        app.Refresh()
+    except Exception as e:
+        return {'ok': False, 'error': '横向缩放失败: %s' % e}
+
+    # 填色 / 去轮廓。用主流程验证过的写法：
+    #   Fill.ApplyUniformFill(app.CreateRGBColor(...)) 而不是 UniformColor.RGBAssign
+    #   Outline.SetNoOutline() 而不是 Outline.Type = 0
+    try:
+        shp.Fill.ApplyUniformFill(app.CreateRGBColor(*rgb))
+        shp.Outline.SetNoOutline()
+    except Exception:
+        try:
+            shp.Fill.UniformColor.RGBAssign(*rgb)
+            shp.Outline.Type = 0
+        except Exception:
+            pass
+
+    # 定位 + 校正
+    err = None
+    for _ in range(8):
+        try:
+            bb = shp.BoundingBox
+            left, top = float(bb.Left), float(bb.Top)
+        except Exception:
+            break
+        dx, dy = x_mm - left, tgt_y - top
+        err = (abs(dx), abs(dy))
+        if abs(dx) < 0.005 and abs(dy) < 0.005:
+            break
+        try:
+            shp.PositionX = shp.PositionX + dx
+            shp.PositionY = shp.PositionY + dy
+            app.Refresh()
+        except Exception:
+            break
+
+    try:
+        bb = shp.BoundingBox
+        got = {'left': round(float(bb.Left), 4), 'top': round(float(bb.Top), 4),
+               'w': round(float(bb.Width), 4), 'h': round(float(bb.Height), 4)}
+        err = (round(abs(got['left'] - x_mm), 4),
+               round(abs(got['top'] - tgt_y), 4),
+               round(abs(got['w'] - tgt_w), 4),
+               round(abs(got['h'] - tgt_h), 4))
+    except Exception:
+        got = None
+    return {'ok': True, 'layer': str(lay.Name), 'size': info, 'bbox_mm': got,
+            'target_mm': [round(x_mm, 4), round(tgt_y, 4),
+                          round(tgt_w, 4), round(tgt_h, 4)],
+            'max_error_mm': max(err) if err else None}
+
+
+def apply_all(args, summary, log=print):
+    """打开/新建 CDR，把 convert 的区域建成活字，保存并回读校验。"""
+    import cdr_common as C
+
+    conv = {k: v for k, v in summary.items()
+            if isinstance(v, dict) and v.get('verdict') == 'convert'}
+    skipped = [k for k, v in summary.items()
+               if isinstance(v, dict) and v.get('verdict') != 'convert']
+    if not conv:
+        log('没有判定为 convert 的区域，不建活字。')
+        if skipped:
+            log('  跳过：%s' % ', '.join(skipped))
+        return 0
+
+    app = C.connect_coreldraw()
+    log('CorelDRAW %s' % app.Version)
+    target = os.path.abspath(args.apply)
+    rgb = _hex_to_rgb(args.live_color)
+
+    if os.path.isfile(target):
+        doc = C.open_document(app, target)
+    else:
+        # 没有现成 CDR：按源图尺寸新建一个，方便先看效果
+        gray = load_gray(args.image)
+        doc = app.CreateDocument()
+        doc.Unit = 3
+        page = doc.Pages.Item(1)
+        page.SetSize(gray.shape[1] * args.mm_per_px,
+                     gray.shape[0] * args.mm_per_px)
+        doc.SaveAs(target, None)
+        log('新建文档 %s  页面 %.3f x %.3f mm'
+            % (target, page.SizeWidth, page.SizeHeight))
+
+    try:
+        doc.Unit = 3
+        doc.ReferencePoint = 3          # 左上角参考点，Position 即包围盒左上
+        page = doc.ActivePage
+    except Exception as e:
+        log('设置文档状态失败: %s' % e)
+        return 1
+
+    results = {}
+    for name, rec in conv.items():
+        log()
+        log('建活字：%s  %r' % (name, rec['text']))
+        log('  字体 %s / %s' % (rec['font']['family'], rec['font']['style']))
+        r = apply_region(app, page, rec, args.mm_per_px,
+                         args.live_layer_suffix, rgb, log)
+        results[name] = r
+        if not r['ok']:
+            log('  [失败] %s' % r['error'])
+            continue
+        log('  字号 %.3f pt  横向缩放 %.5f  →  %.4f x %.4f mm'
+            % (r['size']['size_pt'], r['size']['x_scale'],
+               r['bbox_mm']['w'], r['bbox_mm']['h']))
+        log('  目标 %.4f,%.4f %.4f x %.4f  →  最大误差 %.4f mm'
+            % (r['target_mm'][0], r['target_mm'][1],
+               r['target_mm'][2], r['target_mm'][3], r['max_error_mm']))
+
+    try:
+        C.release_optimization(app)
+        doc.Save()
+        log()
+        log('已保存 %s' % target)
+    except Exception as e:
+        log('保存失败: %s' % e)
+
+    # 回读核验：形状类型必须是 cdrTextShape(6)
+    log()
+    log('回读核验：')
+    for name, r in results.items():
+        if not r['ok']:
+            continue
+        try:
+            lay = None
+            for i in range(1, page.Layers.Count + 1):
+                if str(page.Layers.Item(i).Name) == r['layer']:
+                    lay = page.Layers.Item(i)
+            n = lay.Shapes.Count
+            s = lay.Shapes.Item(1)
+            txt = ''
+            try:
+                txt = str(s.Text.Story.Text)
+            except Exception:
+                pass
+            log('  %s 层 %s：形状 %d 个，类型 %d（6=文本），内容 %r'
+                % (name, r['layer'], n, s.Type, txt[:60]))
+        except Exception as e:
+            log('  %s 回读失败: %s' % (name, e))
+
+    if skipped:
+        log()
+        log('以下区域未转活字（保留描摹轮廓）：%s' % ', '.join(skipped))
+    return 0
+
+
 # --------------------------------------------------------------------------
 # 主流程
 # --------------------------------------------------------------------------
@@ -507,8 +895,28 @@ def main(argv=None):
                          '（默认 1.25，与字号无关）')
     ap.add_argument('--min-iou-floor', type=float, default=0.35,
                     help='相对判据的下限，避免在噪声上判"可转"（默认 0.35）')
+    ap.add_argument('--min-width-ratio', type=float, default=0.65,
+                    help='硬门槛：最佳候选字体的自然宽度比下限（默认 0.65）。'
+                         '文字比字体自然宽度更窄时（负字距/压缩）会偏小')
+    ap.add_argument('--max-width-ratio', type=float, default=1.50,
+                    help='硬门槛：最佳候选字体的自然宽度比上限（默认 1.50）。'
+                         '**这条是拦住"非文字区被 OCR 幻觉成文字"的关键**')
+    ap.add_argument('--min-cc-per-char', type=float, default=0.25,
+                    help='硬门槛：连通分量数 ÷ 字符数 的下限（默认 0.25）。'
+                         '字形连在一起时会偏小')
+    ap.add_argument('--max-cc-per-char', type=float, default=4.0,
+                    help='硬门槛：连通分量数 ÷ 字符数 的上限（默认 4.0）。'
+                         '**这条是拦住"短幻觉"的关键**——真文字实测 1.10，'
+                         '把插图区当文字区时会到 11.0')
     ap.add_argument('--corel-only', action='store_true',
                     help='只用 CorelDRAW 字体表里有的字体（需要 CDR 可用）')
+    ap.add_argument('--apply', metavar='CDR', default=None,
+                    help='把判定为 convert 的区域真的建成活字并写入这个 CDR。'
+                         '文件不存在则按源图尺寸新建')
+    ap.add_argument('--live-layer-suffix', default='_LIVE',
+                    help='活字所在图层的后缀，默认 _LIVE（即 footer_LIVE）')
+    ap.add_argument('--live-color', default='#000000',
+                    help='活字填充色，默认 #000000')
     args = ap.parse_args(argv)
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -670,22 +1078,32 @@ def main(argv=None):
             _write_compare(os.path.join(args.out_dir, 'compare_%s.png' % name),
                            core, mask)
 
-        # --- 判定：字形到底像不像
-        # **不能用绝对 IoU 当门槛**：可达上限取决于文字大小——实测 16px 高的
-        # 页脚，即使用完全正确的文本与正确字体，IoU 也只有 0.61（小字光栅化
-        # 本身就把笔画糊在一起）。用 0.62 的绝对门槛会把完美匹配也拒掉。
-        # 改用**相对判据**：最佳字体相对候选集中位的提升倍数。
-        # 实测正确匹配时最佳/中位 ≈ 1.37x；这个量与小字/大字无关。
+        # --- 判定：先问"这到底是不是一行文字"，再问"像不像这个字体"
         med = fstats['median_iou'] or 1e-9
         lift = round(final_iou / med, 3)
-        ok_abs = final_iou >= args.min_iou
-        ok_rel = (lift >= args.min_lift and final_iou >= args.min_iou_floor)
-        verdict = 'convert' if (ok_abs or ok_rel) else 'keep_trace'
+        gstat = glyph_stats(core)
+        n_char = len(final_text.replace(' ', ''))
+        dec = decide_convert(
+            final_iou, lift, best['width_ratio'], gstat['n_cc'], n_char,
+            min_iou=args.min_iou, min_lift=args.min_lift,
+            min_iou_floor=args.min_iou_floor,
+            min_wr=args.min_width_ratio, max_wr=args.max_width_ratio,
+            min_cc_per_char=args.min_cc_per_char,
+            max_cc_per_char=args.max_cc_per_char)
+        verdict = dec['verdict']
+        print('  字形统计 %d 个连通分量 / %d 个字符 = %.2f'
+              '（中位 %g px，最大/中位 %.2f，填墨率 %.3f）'
+              % (gstat['n_cc'], n_char, dec['checks']['cc_per_char']['value'],
+                 gstat['cc_median_px'], gstat['cc_max_over_median'],
+                 gstat['ink_fill']))
+        for r in dec['reasons']:
+            print('  [拒绝] %s' % r)
 
         with open(os.path.join(args.out_dir, 'font_match_%s.json' % name), 'w',
                   encoding='utf-8') as f:
             json.dump({'text': final_text, 'candidates': cands,
-                       'stats': fstats}, f, ensure_ascii=False, indent=2)
+                       'stats': fstats, 'glyph_stats': gstat,
+                       'decision': dec}, f, ensure_ascii=False, indent=2)
 
         rec = {
             'region': name,
@@ -704,25 +1122,65 @@ def main(argv=None):
             'font_match_iou': best['iou'],
             'rebuild_iou': final_iou,
             'lift_over_median': lift,
+            'glyph_stats': gstat,
+            'decision': dec,
+            'reject_kind': dec['reject_kind'],
             'thresholds': {'min_iou': args.min_iou, 'min_lift': args.min_lift,
-                           'min_iou_floor': args.min_iou_floor},
+                           'min_iou_floor': args.min_iou_floor,
+                           'min_width_ratio': args.min_width_ratio,
+                           'max_width_ratio': args.max_width_ratio,
+                           'min_cc_per_char': args.min_cc_per_char,
+                           'max_cc_per_char': args.max_cc_per_char},
             'verdict': verdict,
         }
         summary[name] = rec
         print('  最佳字体 %s / %s  IoU %.4f  重建复核 %.4f  领先中位 %.2fx'
               % (best['family'], best['style'], best['iou'], final_iou, lift))
-        print('  → %s' % ('转活字' if verdict == 'convert' else
-                          '不转（保留描摹轮廓：字体库里没有足够接近的，'
-                          '或字形相似度不足以证明是同一字体）'))
+        if verdict == 'convert':
+            print('  → 转活字')
+        elif dec['reject_kind'] == 'not_text':
+            print('  → 不转（这块区域**不是一行文字**：区域切分可能把它切错了，'
+                  '或它本来就是图形。保留描摹轮廓）')
+        else:
+            print('  → 不转（保留描摹轮廓：字体库里没有足够接近的字体，'
+                  '字形相似度不足以证明是同一字体）')
 
     with open(os.path.join(args.out_dir, 'live_text.json'), 'w',
               encoding='utf-8') as f:
         json.dump({'image': os.path.abspath(args.image),
                    'mm_per_px': args.mm_per_px,
-                   'min_iou': args.min_iou,
+                   'thresholds': {
+                       'min_iou': args.min_iou,
+                       'min_lift': args.min_lift,
+                       'min_iou_floor': args.min_iou_floor,
+                       'min_width_ratio': args.min_width_ratio,
+                       'max_width_ratio': args.max_width_ratio,
+                       'min_cc_per_char': args.min_cc_per_char,
+                       'max_cc_per_char': args.max_cc_per_char},
                    'regions': summary}, f, ensure_ascii=False, indent=2)
     print()
     print('已写出 %s' % os.path.join(args.out_dir, 'live_text.json'))
+
+    if args.apply:
+        print()
+        print('=' * 74)
+        print('建活字到 %s' % os.path.abspath(args.apply))
+        print('=' * 74)
+        rc = apply_all(args, summary)
+        # 把落盘结果补进 JSON，便于事后核对"判了什么、实际建了什么"
+        for name, r in (summary.items() if rc == 0 else []):
+            if isinstance(r, dict) and r.get('verdict') == 'convert':
+                r['applied'] = True
+        with open(os.path.join(args.out_dir, 'live_text.json'), 'w',
+                  encoding='utf-8') as f:
+            json.dump({'image': os.path.abspath(args.image),
+                       'mm_per_px': args.mm_per_px,
+                       'min_iou': args.min_iou,
+                       'min_lift': args.min_lift,
+                       'min_iou_floor': args.min_iou_floor,
+                       'applied_to': os.path.abspath(args.apply),
+                       'regions': summary}, f, ensure_ascii=False, indent=2)
+        return rc
     return 0
 
 
