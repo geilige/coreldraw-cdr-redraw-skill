@@ -193,6 +193,27 @@ def _tighten(ink_ext, r, pad_px=0):
     return dict(r, y0=y0, y1=y1, x0=x0, x1=x1)
 
 
+def _is_full_bleed(ink_raw, y0, y1):
+    """候选色带是否真的"满版"：在其行范围内，**每一列**都必须有墨迹。
+
+    为什么光有行中位数不够：行中位数只问"这一行整体偏深吗"，两个并排的实心
+    内容块也能把中位数压到 128 以下（实测合成图：两个 150px 宽的实心黑块放在
+    600px 宽的图里，304/600 像素为暗，中位数就是暗的），于是整条内容行带被
+    误判成色带——后果是把两块内容当成"垫底矩形 + 反白描摹"，输出完全错。
+
+    满版色带的定义特征是**横向贯通**：底色顶到左右页边，所以它的行范围内
+    每一列都至少有一个墨迹像素。两块并排内容之间的空隙列则一个墨迹像素都没有。
+
+    用未剥离的墨迹图判定，因为残留条本身也是"贯通"的（vonder 图左侧 4px），
+    它不该让真色带被否掉。而真色带即使中间被反白字标掏空，字的上下仍有纯底色行，
+    所以被掏空的列照样有墨迹——实测 vonder 色带 y 901..1059，字标占 y 926..1040，
+    其上方 25 行与下方 19 行是纯底色，因此全列通过。
+    """
+    if y1 <= y0:
+        return False
+    return bool(ink_raw[y0:y1, :].any(axis=0).all())
+
+
 def auto_partition(src, color_img, min_ink_px=4, min_gap_px=6, min_run_px=6,
                    band_med_max=128, band_min_rows=10, col_gap_frac=0.05,
                    split=True, edge_gray=200, pad_px=0):
@@ -209,14 +230,19 @@ def auto_partition(src, color_img, min_ink_px=4, min_gap_px=6, min_run_px=6,
 
     for by0, by1 in _row_bands(ink, 0, H, min_ink_px, min_gap_px, min_run_px):
         dark = row_med[by0:by1] < band_med_max
-        bands = [(a, b) for a, b in _runs(dark) if b - a >= band_min_rows]
-        if not bands:
-            raw.append({"kind": "content", "y0": by0, "y1": by1, "invert": False})
-            continue
-        for a, b in bands:
-            raw.append({"kind": "band", "y0": by0 + a, "y1": by0 + b,
-                        "invert": True, "color": _band_color(color_img, by0 + a, by0 + b)})
-        # 色带之外的行段再按行投影细切
+        # 行中位数说是"深"，还得横向贯通才算色带；不贯通的一律按内容处理
+        for a, b in _runs(dark):
+            s0, s1 = by0 + a, by0 + b
+            if b - a >= band_min_rows and _is_full_bleed(ink_raw, s0, s1):
+                raw.append({"kind": "band", "y0": s0, "y1": s1, "invert": True,
+                            "color": _band_color(color_img, s0, s1)})
+                continue
+            # 不够高、或不是满版：按内容处理，仍要按行投影细切
+            if s1 - s0 < min_run_px:
+                continue
+            for cy0, cy1 in _row_bands(ink, s0, s1, min_ink_px, min_gap_px, min_run_px):
+                raw.append({"kind": "content", "y0": cy0, "y1": cy1, "invert": False})
+        # 浅色行段：按行投影细切
         for a, b in _runs(~dark):
             s0, s1 = by0 + a, by0 + b
             if s1 - s0 < min_run_px:
