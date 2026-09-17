@@ -361,6 +361,15 @@ def trace_all(src, regions, args, log):
             "subpaths": len(subs),
             "type": r["type"],
             "threshold": thr,
+            # kind/color 也记下来：满版色带的垫底矩形是从这里推出来的，
+            # 报告重建（--report-only）时若清单里没有 rects 就能反推回去。
+            "kind": r.get("kind"),
+            "color": list(r["color"]) if r.get("color") else None,
+            # 把寻优指标一并写进清单，报告才可脱离描摹过程独立重建
+            "iou": m["iou"],
+            "recall": m["recall"],
+            "precision": m["precision"],
+            "ink_ratio": m["ink_ratio"],
         }
         info[name] = {"type": r["type"], "threshold": thr, "subpaths": len(subs),
                       "bbox_mm": [round(mx0, 4), round(my0, 4),
@@ -433,7 +442,8 @@ def validate(args, placement, log):
 # ----------------------------------------------------------------------------
 
 
-def write_report(args, src, edges, info, rects, metrics, cdr_ok, placement, log):
+def write_report(args, src, edges, info, rects, metrics, cdr_ok, placement, log,
+                 page_h_explicit=False):
     """写 report.md 与 report.json，返回 markdown 文本。"""
     L = []
     A = L.append
@@ -443,12 +453,16 @@ def write_report(args, src, edges, info, rects, metrics, cdr_ok, placement, log)
     A(f"- 像素尺寸：{src.img_w} x {src.img_h}")
     A(f"- 页面：{src.page_w_mm:g} x {src.page_h_mm:g} mm")
     A(f"- 标定：1 px = {src.mm_per_px:.6f} mm（按宽度 {src.page_w_mm:g} mm 标定）")
-    ratio_img = src.img_w / src.img_h
-    ratio_pg = src.page_w_mm / src.page_h_mm
-    if abs(ratio_img - ratio_pg) / ratio_pg > 0.02:
-        A(f"- **比例提示**：图宽高比 {ratio_img:.4f} 与页面宽高比 {ratio_pg:.4f} "
-          f"不一致，纵向内容实际高度 {src.page_h_mm_derived:.3f} mm，"
-          f"比页面高度少 {src.page_h_mm - src.page_h_mm_derived:.3f} mm。")
+    # 只有用户**明确指定**了页面高度时，比例不一致才算问题；
+    # 没指定时高度本来就是按图比例推导的，警告会是噪音。
+    # 分母都做零检查：--report-only 读的清单可能缺 image_px / page_mm。
+    if page_h_explicit and src.img_h and src.page_h_mm:
+        ratio_img = src.img_w / src.img_h
+        ratio_pg = src.page_w_mm / src.page_h_mm
+        if ratio_pg and abs(ratio_img - ratio_pg) / ratio_pg > 0.02:
+            A(f"- **比例提示**：图宽高比 {ratio_img:.4f} 与页面宽高比 {ratio_pg:.4f} "
+              f"不一致，纵向内容实际高度 {src.page_h_mm_derived:.3f} mm，"
+              f"比页面高度少 {src.page_h_mm - src.page_h_mm_derived:.3f} mm。")
     A("")
     if edges.get("left_dark_cols", 0) >= 2:
         A(f"> **边缘残留**：源图最左侧有 {edges['left_dark_cols']} 列连续暗边"
@@ -462,11 +476,16 @@ def write_report(args, src, edges, info, rects, metrics, cdr_ok, placement, log)
     A("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for name, d in info.items():
         b = d["bbox_mm"]
-        A(f"| `{name}` | {d['type']} | {d['source_box_px'][0]},{d['source_box_px'][1]}"
-          f"..{d['source_box_px'][2]},{d['source_box_px'][3]} "
+        sb = d.get("source_box_px") or [0, 0, 0, 0]
+        # 旧清单可能没有寻优指标（iou/ink_ratio 是后加的字段），缺就显示 "—"，
+        # 不要崩，也不要假装是 0（0 会被误读成"完全不像"）。
+        iou, ink = d.get("iou"), d.get("ink_ratio")
+        s_iou = "—" if iou is None else f"{iou:.2f}"
+        s_ink = "—" if ink is None else f"{ink:.3f}"
+        A(f"| `{name}` | {d.get('type', '?')} | {sb[0]},{sb[1]}..{sb[2]},{sb[3]} "
           f"| {b[0]:.3f},{b[1]:.3f}..{b[2]:.3f},{b[3]:.3f} "
-          f"| {b[2]-b[0]:.3f} x {b[3]-b[1]:.3f} | {d['threshold']} "
-          f"| {d['subpaths']} | {d['iou']:.2f} | {d['ink_ratio']:.3f} |")
+          f"| {b[2]-b[0]:.3f} x {b[3]-b[1]:.3f} | {d.get('threshold', '—')} "
+          f"| {d.get('subpaths', '—')} | {s_iou} | {s_ink} |")
     A("")
     if rects:
         A("## 垫底矢量矩形（原生对象，非描摹）")
@@ -493,7 +512,8 @@ def write_report(args, src, edges, info, rects, metrics, cdr_ok, placement, log)
             A("| 区域 | IoU% | 召回% | 精确% |")
             A("| --- | --- | --- | --- |")
             for k, v in reg.items():
-                A(f"| `{k}` | {v['iou']:.2f} | {v['recall']:.2f} | {v['precision']:.2f} |")
+                A(f"| `{k}` | {v.get('iou', 0):.2f} | {v.get('recall', 0):.2f} "
+                  f"| {v.get('precision', 0):.2f} |")
             A("")
         A("图例：深灰=一致，红=仅源图（漏画），蓝=仅重绘（多画）。"
           "对照图见 `compare/overlay_diff.png` 与 `compare/zoom/`。")
@@ -560,8 +580,10 @@ def build_parser():
     ap = argparse.ArgumentParser(
         description="位图 -> CorelDRAW 矢量 CDR：一条命令跑完全流程",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--image", required=True, help="源位图路径（PNG/JPG）")
-    ap.add_argument("--output", required=True, help="输出 CDR 路径")
+    ap.add_argument("--image", default=None,
+                    help="源位图路径（PNG/JPG）。--report-only 时可省略")
+    ap.add_argument("--output", default=None,
+                    help="输出 CDR 路径。--report-only 时可省略")
     ap.add_argument("--page-width", type=float, default=None, help="页面宽度（毫米）")
     ap.add_argument("--page-height", type=float, default=None,
                     help="页面高度（毫米）；省略则按图比例推导")
@@ -601,6 +623,10 @@ def build_parser():
     ap.add_argument("--trace-only", action="store_true",
                     help="只描摹出 SVG 与清单，不建 CDR（无 CorelDRAW 也能跑）")
     ap.add_argument("--no-validate", action="store_true", help="跳过配准式像素校验")
+    ap.add_argument("--report-only", action="store_true",
+                    help="不重跑描摹与建 CDR，仅用已有 svg/manifest.json 与 "
+                         "compare/metrics.json 重建 report.md / report.json。"
+                         "改一行报告措辞不该重跑十几分钟描摹")
     ap.add_argument("--close-existing", default=None,
                     help="建 CDR 前关闭名称以此前缀开头的已打开文档；"
                          "默认按输出文件名关闭同名文档，用 --keep-existing 关闭该行为")
@@ -611,6 +637,16 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+
+    if args.report_only:
+        return _report_only(args)
+
+    if not args.image:
+        print("必须给出 --image（或用 --report-only 重建报告）。", file=sys.stderr)
+        return 1
+    if not args.output:
+        print("必须给出 --output（或用 --report-only 重建报告）。", file=sys.stderr)
+        return 1
     args.image = os.path.abspath(args.image)
     args.output = os.path.abspath(args.output)
     if not os.path.isfile(args.image):
@@ -632,6 +668,8 @@ def main(argv=None):
 
     args.tune_list = [int(t) for t in str(args.tune_thresholds).split(",") if t.strip()]
     args.image_used = args.image
+    # 页面高度是"用户明确给的"还是"按图比例推导的"——决定报告里要不要提比例偏差
+    args.page_h_explicit = bool(args.page_size) or args.page_height is not None
 
     logfile = open(os.path.join(args.out_dir, "run.log"), "w", encoding="utf-8")
 
@@ -642,6 +680,151 @@ def main(argv=None):
 
     try:
         return _run(args, log)
+    finally:
+        logfile.close()
+
+
+# ----------------------------------------------------------------------------
+# 仅重建报告
+# ----------------------------------------------------------------------------
+
+
+class _ShimSource:
+    """从清单里的标定数据伪装的 Source，供 write_report 使用。
+
+    write_report 只用到这几个只读属性；为了改一行报告措辞而重新打开位图、
+    重新标定是不必要的（而且源图可能已经被移动或删除）。
+    """
+
+    def __init__(self, manifest, image_used):
+        self.path = image_used
+        self.img_w, self.img_h = (int(v) for v in manifest.get("image_px", [0, 0]))
+        pm = manifest.get("page_mm") or [0.0, 0.0]
+        self.page_w_mm = float(pm[0])
+        self.page_h_mm = float(pm[1])
+        self.mm_per_px = float(manifest.get("mm_per_px")
+                               or (self.page_w_mm / self.img_w if self.img_w else 0))
+        self.page_h_mm_derived = self.img_h * self.mm_per_px
+
+
+_NEUTRAL_EDGES = {
+    "left": {"mean": 0, "dark": False}, "right": {"mean": 0, "dark": False},
+    "top": {"mean": 0, "dark": False}, "bottom": {"mean": 0, "dark": False},
+    "left_dark_cols": 0,
+}
+
+
+def _read_json(path, default=None):
+    if path and os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            pass
+    return default
+
+
+def _find_placement(out_dir, output=None):
+    """找定位记录 json（cdr_image_place.py 的产物）。
+
+    它落在 **CDR 同目录**（placement.json），不是工作目录，所以两个地方都要找。
+    """
+    for d in (out_dir, os.path.dirname(os.path.abspath(output)) if output else None):
+        if not d:
+            continue
+        try:
+            cands = sorted(n for n in os.listdir(d)
+                           if n.endswith(".json") and "place" in n.lower())
+        except OSError:
+            continue
+        if cands:
+            return os.path.join(d, cands[0])
+    return None
+
+
+def _report_only(args):
+    """用已有清单与指标重建 report.md / report.json，不重跑描摹与建 CDR。
+
+    为什么需要：报告里的数字来自两个阶段（逐区寻优在前，配准校验在后），
+    早先的实现在校验**之前**就写了报告，于是报告里的还原度停留在有 bug 时期的
+    旧值（整页 24.47%），而真实值是 93.62%。修好顺序后仍不够——改一行措辞
+    也不该重跑十几分钟描摹，所以清单里补齐了寻优指标、垫底矩形与图层顺序，
+    让报告可以完全脱离描摹过程独立重建。
+    """
+    if not args.out_dir:
+        if not args.output:
+            print("--report-only 需要 --out-dir，或给出 --output 以便推导工作目录",
+                  file=sys.stderr)
+            return 1
+        stem0 = os.path.splitext(os.path.basename(args.output))[0]
+        args.out_dir = os.path.join(os.path.dirname(os.path.abspath(args.output)),
+                                    f"{stem0}_work")
+    args.out_dir = os.path.abspath(args.out_dir)
+    args.svg_dir = os.path.join(args.out_dir, "svg")
+    args.compare_dir = os.path.join(args.out_dir, "compare")
+
+    mpath = os.path.join(args.svg_dir, "manifest.json")
+    manifest = _read_json(mpath)
+    if not manifest:
+        print(f"找不到或读不出清单 {mpath}；--report-only 需要先跑过一次描摹",
+              file=sys.stderr)
+        return 1
+
+    stem = os.path.basename(args.out_dir.rstrip("\\/"))
+    stem = stem[:-5] if stem.endswith("_work") else stem
+    if not args.output:
+        args.output = os.path.join(os.path.dirname(args.out_dir), f"{stem}.cdr")
+    args.preview = os.path.join(args.out_dir, f"{stem}_preview.png")
+    args.image_used = manifest.get("source_image") or (args.image or "")
+
+    logfile = open(os.path.join(args.out_dir, "run.log"), "a", encoding="utf-8")
+
+    def log(msg=""):
+        print(msg)
+        logfile.write(str(msg) + "\n")
+        logfile.flush()
+
+    try:
+        src = _ShimSource(manifest, args.image_used)
+        # 边缘残留探测结果优先从上一版报告里继承（重跑它要重新打开源图）
+        edges = (_read_json(os.path.join(args.out_dir, "report.json"), {})
+                 .get("edge_probe")) or dict(_NEUTRAL_EDGES)
+        info = manifest.get("regions") or {}
+        rects = []
+        for r in manifest.get("rects") or []:
+            d = {k: v for k, v in r.items() if k != "name"}
+            if "rgb" in d:
+                d["rgb"] = tuple(d["rgb"])
+            rects.append((r["name"], d))
+        if not rects:
+            # 旧清单（在写入 rects 字段之前生成的）没有矩形记录，
+            # 但满版色带的垫底矩形可以由区域本身推出来：bbox 就是矩形。
+            for name, d in info.items():
+                if d.get("type") != "BAND" or not d.get("color"):
+                    continue
+                b = d["bbox_mm"]
+                rects.append((name, {"x": b[0], "y": b[1], "w": b[2] - b[0],
+                                     "h": b[3] - b[1], "rgb": tuple(d["color"])}))
+        metrics = _read_json(os.path.join(args.compare_dir, "metrics.json"))
+        placement = _find_placement(args.out_dir, args.output)
+        cdr_ok = bool(args.output) and os.path.isfile(args.output)
+
+        log("=" * 68)
+        log("仅重建报告（--report-only）")
+        log("=" * 68)
+        log(f"  清单      : {mpath}")
+        log(f"  区域      : {len(info)} 个；垫底矩形 {len(rects)} 个")
+        log(f"  配准指标  : {'有' if metrics else '无（compare/metrics.json 不存在）'}")
+        log(f"  页面      : {src.page_w_mm:g} x {src.page_h_mm:g} mm，"
+            f"{src.img_w} x {src.img_h} px，1 px = {src.mm_per_px:.6f} mm")
+        md = write_report(args, src, edges, info, rects, metrics, cdr_ok, placement,
+                          log, page_h_explicit=bool(manifest.get("page_h_explicit")))
+        if metrics:
+            o = metrics.get("overall", {})
+            log(f"  还原度    : 整页 IoU {o.get('iou', 0):.2f}%  "
+                f"召回 {o.get('recall', 0):.2f}%  精确 {o.get('precision', 0):.2f}%")
+        log(f"  字数      : {len(md)} 字符")
+        return 0
     finally:
         logfile.close()
 
@@ -742,6 +925,14 @@ def _run(args, log):
     log(f"  图层（自下而上）: {layer_order}")
     log(f"  垫底矩形 {len(rects)} 个，反白填充区域 {sorted(white) or '无'}")
 
+    # 把垫底矩形也写回清单，这样 --report-only 能脱离建 CDR 过程重建报告
+    manifest["rects"] = [{"name": n, **r} for n, r in rects]
+    manifest["layer_order"] = layer_order
+    manifest["page_h_explicit"] = bool(getattr(args, "page_h_explicit", False))
+    with open(os.path.join(args.svg_dir, "manifest.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
     # 7) 建 CDR
     cdr_ok, placement, metrics = False, None, None
     if args.trace_only:
@@ -761,7 +952,8 @@ def _run(args, log):
             log("附加  配准式像素校验")
             metrics = validate(args, placement, log)
 
-    md = write_report(args, src, edges, info, rects, metrics, cdr_ok, placement, log)
+    md = write_report(args, src, edges, info, rects, metrics, cdr_ok, placement, log,
+                      page_h_explicit=getattr(args, "page_h_explicit", False))
 
     log("")
     log("=" * 68)

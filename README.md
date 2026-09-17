@@ -51,6 +51,10 @@ python skills\coreldraw-x8-redraw\scripts\cdr_bitmap_to_cdr.py ^
   --image ref.png --page-width 210 --output out\ref.cdr ^
   --region "art:6,500,1217,900" ^
   --region "logo:0,901,1217,1059,invert"
+
+# 只重建报告，不重跑描摹与建 CDR（几秒钟）
+python skills\coreldraw-x8-redraw\scripts\cdr_bitmap_to_cdr.py ^
+  --report-only --out-dir out\ref_work --output out\ref.cdr
 ```
 
 ## 这个技能能做什么
@@ -115,6 +119,21 @@ python skills\coreldraw-x8-redraw\scripts\cdr_bitmap_to_cdr.py ^
 | 工具群插图 | 97.55% | 1.007 |
 | 6pt 页脚文字 | 93.81% | 0.993 |
 | **整页配准** | **93.48%**（召回 95.33% / 精确 97.97%） | — |
+
+**全自动流水线（一条命令，同一张图）** —— 分区坐标由脚本自己判出来，
+与上面手工调优的毫米包围盒**一致到 0.1 mm**：
+
+| 区域 | 自动选中的阈值 | 原生分辨率 IoU | 面积比 |
+| --- | --- | --- | --- |
+| `band01_ink`（反白字标） | 138 | 99.51% | 1.000 |
+| `mark01`（易碎标） | 128 | 98.47% | 1.006 |
+| `art01`（工具群插图） | 128 | 97.62% | 1.015 |
+| `text01`（6pt 页脚） | 118 | 93.59% | 0.998 |
+| **整页配准** | — | **93.70%**（召回 95.54% / 精确 97.98%） | — |
+
+整页 93.70% 略高于手工版 93.48%，阈值选择（138/128/128/118）也与手工细调吻合。
+剩下几个点差在哪：源图最左侧 4px 贯穿全高的裁切残留**有意未复刻**，
+差异图 `overlay_diff.png` 里那条红线就是它；其余为描摹固有的 1px 边缘偏差。
 
 ## 安装
 

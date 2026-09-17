@@ -291,6 +291,10 @@ python skills\coreldraw-x8-redraw\scripts\cdr_bitmap_to_cdr.py ^
   --image ref.png --page-width 210 --output out\cover.cdr ^
   --region "art_tools:6,500,1217,900" ^
   --region "logo_vonder:0,901,1217,1059,invert"
+
+# 只重建报告，不重跑描摹与建 CDR
+python skills\coreldraw-x8-redraw\scripts\cdr_bitmap_to_cdr.py ^
+  --report-only --out-dir out\cover_work --output out\cover.cdr
 ```
 
 区域坐标是**源图像素**，左上为原点，格式 `名称:x0,y0,x1,y1[,invert]`。
@@ -384,10 +388,23 @@ python skills\coreldraw-x8-redraw\scripts\cdr_visual_diff.py ^
 | Fragile 标（含小图标） | ≈ 98.3% |
 | 精细线稿插图 | ≈ 97.5% |
 | 6pt 级小字 | ≈ 93.8% |
-| 整页配准 | ≈ 93.5% |
+| 整页配准 | ≈ 93.7% |
 
 **达不到 100% 是正常的**——描摹必然在边缘产生 1px 级偏差。
 重点是看指标偏低的是"漏画"（召回低）还是"多画/变粗"（精确低）。
+
+全自动流水线（一条命令，脚本自己分区）实测与上表一致，甚至略好：
+
+| 区域 | 自动选中阈值 | 原生分辨率 IoU | 面积比 |
+| --- | --- | --- | --- |
+| `band01_ink`（反白字标） | 138 | 99.51% | 1.000 |
+| `mark01`（易碎标） | 128 | 98.47% | 1.006 |
+| `art01`（工具群插图） | 128 | 97.62% | 1.015 |
+| `text01`（6pt 页脚） | 118 | 93.59% | 0.998 |
+| **整页配准** | — | **93.70%**（召回 95.54% / 精确 97.98%） | — |
+
+自动分区判出的毫米包围盒与手工调优**一致到 0.1 mm**，选中的阈值也与手工细调吻合。
+所以先用默认参数跑一条命令，只有明显不对的区域才需要 `--region` 手工接管。
 
 ### ⚠️ 别用眼睛判断笔画粗细
 
@@ -623,6 +640,26 @@ print(svg.count("C"), svg.count("L"))   # 曲线段为 0 就是多边形
 > 手工配置里矩形和字标天然在不同图层，所以这个 bug 只在自动分区把两者
 > 归到同一图层时才暴露。
 
+### Q22：报告里的还原度数字对不上（IoU 显示 24%，实际看着挺好）
+
+报告里的还原度来自**配准校验阶段**，而写报告曾经排在它**之前**，
+于是报告写的是校验前的空值/旧值。实测症状：`report.md` 里
+`整页 IoU 24.47%`、`召回 37.31%`，而 `compare\metrics.json` 里是
+`93.62% / 95.14%`。
+
+两件事都修了：
+
+1. 写报告移到校验**之后**（顺序问题）；
+2. 清单 `manifest.json` 补记每区的 `iou/recall/precision/ink_ratio`、
+   垫底矩形 `rects`、图层顺序 `layer_order`，报告可脱离描摹独立重建：
+
+```powershell
+python scripts\cdr_bitmap_to_cdr.py --report-only ^
+  --out-dir out\cover_work --output out\cover.cdr
+```
+
+几秒钟出新报告，不必重跑十几分钟描摹。细节见「十、报告为什么可以单独重建」。
+
 ---
 
 ## 八、脚本参数速查
@@ -631,8 +668,8 @@ print(svg.count("C"), svg.count("L"))   # 曲线段为 0 就是多边形
 
 | 参数 | 说明 |
 | --- | --- |
-| `--image` | 必填，源位图路径（PNG/JPG） |
-| `--output` | 必填，输出 CDR 路径 |
+| `--image` | 源位图路径（PNG/JPG）；`--report-only` 时可省略 |
+| `--output` | 输出 CDR 路径；`--report-only` 时可省略 |
 | `--page-width` | 页面宽度（毫米） |
 | `--page-height` | 页面高度（毫米）；省略则按图比例推导 |
 | `--page-size` | 标准纸型 `A4`/`A3`/`A5`/`Letter` 或 `宽x高`；给定时覆盖上面两项的高度 |
@@ -645,13 +682,17 @@ print(svg.count("C"), svg.count("L"))   # 曲线段为 0 就是多边形
 | `--opttolerance` | 曲线优化容差，默认 0.1 |
 | `--threshold` | 固定二值化阈值；给定时不做逐区寻优 |
 | `--tune-thresholds` | 寻优候选阈值，默认 `112,118,128,138,148` |
-| `--max-tune-px` | 源像素面积超过此值的区域只扫 3 个候选阈值，默认 400000 |
+| `--max-tune-px` | 源像素面积超过此值的区域只扫 3 个候选阈值，默认 200000 |
 | `--crop-left` | 忽略源图最左侧 N 列（裁切/扫描残留），并按其后的宽度重新标定 |
 | `--no-split` | 不做列方向切分 |
 | `--trace-only` | 只描摹出 SVG 与清单，不建 CDR（无 CorelDRAW 也能跑） |
 | `--no-validate` | 跳过配准式像素校验 |
+| `--report-only` | 不重跑描摹与建 CDR，仅用已有清单与指标重建报告 |
 | `--keep-existing` | 不自动关闭同名已打开文档 |
 | `--progid` | CorelDRAW ProgID，默认 `CorelDRAW.Application.18` |
+
+`--report-only` 时 `--image` / `--output` 可省略，但需要 `--out-dir`
+（或用 `--output` 推导出工作目录）。它的存在理由见下节「十、报告为什么可以单独重建」。
 
 ### cdr_prompt_builder.py
 
@@ -736,3 +777,56 @@ print(svg.count("C"), svg.count("L"))   # 曲线段为 0 就是多边形
 `1` = 输入有误（找不到源图、没给页面尺寸）；`2` = 描摹成功但没建出 CDR
 （CorelDRAW 不可用或保存失败）。**描摹段产物与报告在 `2` 时仍然有效**，
 可以直接用 `--trace-only` 重跑或单独调用 `cdr_image_place.py` 补建。
+
+---
+
+## 十、报告为什么可以单独重建
+
+报告里的数字来自流水线的**两个不同阶段**：
+
+| 阶段 | 产出 | 报告里的位置 |
+| --- | --- | --- |
+| 步骤 4 逐区寻优 + 描摹 | 每区的阈值、IoU、面积比 | 「分区与参数」表 |
+| 附加 配准式像素校验 | 整页/分区域 IoU、召回、精确 | 「还原度」表 |
+
+早先的实现把写报告放在校验**之前**，于是报告里的还原度停留在有 bug 时期的
+旧值——整页 IoU 显示 **24.47%**，而真实值是 **93.62%**。顺序修好后还有第二个问题：
+报告措辞改一个字也要重跑十几分钟描摹，不可接受。
+
+所以清单 `manifest.json` 里补齐了报告所需的全部字段：
+
+```json
+{
+  "source_image": "...", "page_mm": [210.0, 286.4421], "mm_per_px": 0.17255546,
+  "image_px": [1217, 1660], "params": {"upscale": 8, "alphamax": 1.0},
+  "page_h_explicit": false,
+  "layer_order": ["BAND", "02_INK", "03_MARK", "04_ART", "05_TEXT"],
+  "rects": [{"name": "band01", "x": 0, "y": 155.47, "w": 210, "h": 27.26,
+             "rgb": [18, 16, 17]}],
+  "regions": {
+    "band01_ink": {
+      "svg": "...", "bbox_mm": [...], "size_mm": [...], "invert": true,
+      "source_box_px": [0, 901, 1217, 1059], "subpaths": 13,
+      "type": "BAND", "threshold": 138, "kind": "band", "color": [18, 16, 17],
+      "iou": 99.51, "recall": 99.76, "precision": 99.75, "ink_ratio": 1.0
+    }
+  }
+}
+```
+
+有了这些，报告就能完全脱离描摹过程重建：
+
+```powershell
+python scripts\cdr_bitmap_to_cdr.py --report-only ^
+  --out-dir out\cover_work --output out\cover.cdr
+```
+
+它会读 `svg\manifest.json` 与 `compare\metrics.json`，不必打开源位图
+（源图被移动或删除也不影响），几秒钟出报告。
+
+两个细节：
+
+- **缺字段显示 `—`，不显示 0。** 旧清单没有 `iou` 时若按 0 打印，
+  会被误读成「完全不像」；按 `—` 打印才是诚实的。
+- **垫底矩形能反推。** 若清单里没有 `rects`（旧版清单），
+  满版色带的垫底矩形可由该区域的 `bbox_mm` 直接推出，报告不会缺这一段。

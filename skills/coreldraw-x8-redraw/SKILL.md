@@ -51,7 +51,19 @@ python scripts\cdr_bitmap_to_cdr.py --image ref.png --page-width 210 ^
   --output out\ref.cdr ^
   --region "art:6,500,1217,900" ^
   --region "logo:0,901,1217,1059,invert"
+
+# 只重建报告，不重跑描摹与建 CDR
+python scripts\cdr_bitmap_to_cdr.py --report-only --out-dir out\ref_work ^
+  --output out\ref.cdr
 ```
+
+`--report-only` 的存在理由：报告里的数字来自两个阶段（逐区寻优在前、配准校验在后），
+早先的实现在校验**之前**就写了报告，于是报告里的还原度停留在有 bug 时期的旧值
+（整页 24.47%），真实值是 93.62%。顺序修好后仍不够——改一行措辞也不该重跑
+十几分钟描摹。所以清单里补齐了每区的 `iou/recall/precision/ink_ratio`、
+垫底矩形 `rects`、图层顺序 `layer_order` 与 `page_h_explicit`，
+让报告可以完全脱离描摹过程独立重建。清单缺这些字段时会显示 `—` 而不是 0
+（0 会被误读成"完全不像"）。
 
 ## 位图矢量化流程（脚本内部六步）
 
@@ -168,6 +180,9 @@ python scripts\cdr_bitmap_to_cdr.py --image ref.png --page-width 210 ^
 - 源图边缘的扫描/裁切残留**不得复刻为设计内容**，但必须在交付说明中提及，
   避免被误判为漏画。
 - 不得声称与源文件"完全一致"；应给出配准指标（IoU / 召回 / 精确）与已知偏差。
+- 报告里的还原度必须与 `compare/metrics.json` **一致**。两者矛盾说明报告是在
+  校验之前写的——这是真实踩过的坑（`report.md` 写 24.47%，
+  `metrics.json` 是 93.62%）。交付物自相矛盾比数字偏低更糟。
 - 保留参数块或参数文件（`manifest.json` / `report.json`），
   使文件可用变更后的尺寸重新生成。
 
@@ -306,7 +321,11 @@ python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cd
 ```text
 python scripts\cdr_bitmap_to_cdr.py --image ref.png --page-width 210 --output out\ref.cdr
 python scripts\cdr_bitmap_to_cdr.py --image ref.png --page-size A4 --output out\ref.cdr --trace-only
+python scripts\cdr_bitmap_to_cdr.py --report-only --out-dir out\ref_work --output out\ref.cdr
 ```
+
+退出码：`0` 成功（或 `--trace-only`）；`1` 参数/文件问题；`2` CDR 未生成
+（CorelDRAW 不可用、pywin32 缺失等），此时 SVG 与报告仍然有效。
 
 ### 位图矢量化三件套（主入口内部会调用，也可单独用）
 
