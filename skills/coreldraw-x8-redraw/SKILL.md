@@ -1,160 +1,207 @@
 ---
 name: coreldraw-x8-redraw
-description: 通过 COM 自动化操作 CorelDRAW X8（及更高版本），剖析、精确重绘并校验 CDR 文件。当需要重建 / 复刻 / 批量处理 CorelDRAW 文档、提取 CDR 的页面·图层·形状·文本结构、把源 CDR 或 PDF/图片参考重建为可编辑 CDR，或校验重建结果与源文件是否一致时使用。也适用于把位图参考图（PNG/JPG）描摹成矢量并在 CorelDRAW 中重建。Trigger keywords - CorelDRAW, CorelDRAW X8, CDR, 重绘, 复刻, 重建, 描摹, 矢量化, redraw, rebuild, trace, vectorize, VGCore, pywin32。
+description: 给一张位图（PNG/JPG 设计稿、扫描件、包装稿导出图），自动操作 CorelDRAW 把它画成矢量图——标定、自动分区、逐区描摹、在 CDR 中建页建图层并精确定位、配准式像素校验，一条命令跑完。也支持源 CDR 剖析重建、PDF 派生、图片+尺寸参数化绘制，以及校验重建结果与源文件是否一致。Trigger keywords - CorelDRAW, CorelDRAW X8, CDR, 位图转矢量, 矢量化, 描摹, 自动绘制, 重绘, 复刻, 重建, redraw, rebuild, trace, vectorize, bitmap to vector, VGCore, pywin32。
 agent_created: true
 ---
 
-# CorelDRAW X8 CDR 重绘
+# CorelDRAW X8 位图矢量化与 CDR 重绘
 
-用四种输入模式之一，然后校验产出的 CDR：
+## 主用途
 
-1. **源 CDR 模式**：剖析 CDR，生成标准化的文件专属提示词，并精确重建。
-2. **PDF 派生模式**：把 PDF 转成可审计的中间 CDR，再用源 CDR 流程重建并校验。
-3. **图片 + 尺寸模式**：把参考图片与权威尺寸归一化为参数规格，生成矢量几何并校验。
-4. **位图矢量化模式**：把 PNG/JPG 参考图分区描摹为矢量，在 CorelDRAW 中按毫米坐标重建并配准校验。
+**用户提供一张位图，本技能自动操作 CorelDRAW 软件，画出这张位图对应的矢量化图形。**
 
-本技能与 AutoCAD 的 `autocad-dwg-redraw` 技能同构：**剖析 → 生成提示词 → 重建 → 校验**。
-区别在于操作对象是 CorelDRAW 的文档 / 页面 / 图层 / 形状模型，而非 DWG 的 ModelSpace / PaperSpace。
+用户给的是一张图（设计稿截图、扫描件、包装稿导出图、参考照片），要求"照着这张图在
+CorelDRAW 里画出来"——走下面的位图矢量化主线，一条命令跑完。
 
-> **位图矢量化请先读 `references/raster-to-vector-notes.md`。**
-> 那份文档记录了 potracer 的 invert 约定、evenodd、`Z M` 分隔符、
-> 上采样对细部保真的影响、X8 的 `ExportEx` 缺陷与配准校验方法，
-> 都是实测踩坑结论，照做可以省掉大量试错。
+## 快速开始（一条命令）
 
-## 核心原则
+```powershell
+python scripts\cdr_bitmap_to_cdr.py --image ref.png --page-width 210 --output out\ref.cdr
+```
 
-源 CDR 可用时，**不要**仅凭截图或视觉风格去推断。先提取或复制真实形状，再与原始文件校验。
+只用给**源图**和**页面宽度**。脚本自动完成全部六步，产出：
 
-最终交付优先使用 CorelDRAW COM 的**形状级精确复制**（`Shape.CopyToLayer`）。
-只有在用户明确需要可审计源码、且已提取完整结构化数据时，才生成重建代码。
+| 产物 | 位置 |
+| --- | --- |
+| 矢量 CDR | `--output` 指定 |
+| 预览 PNG | `<out-dir>/<文件名>_preview.png` |
+| 描摹 SVG 与清单 | `<out-dir>/svg/`（每区一个 SVG + `manifest.json`） |
+| 定位记录 | CDR 同目录 `placement.json` |
+| 配准校验与差异图 | `<out-dir>/compare/`（`overlay_diff.png`、`zoom/`、`metrics.json`） |
+| 报告 | `<out-dir>/report.md` + `report.json` |
 
-图片 + 尺寸输入时，把用户给出的尺寸、单位、数量与版面约束视为权威；
-像素只用于判断拓扑、顺序与视觉关系。当图片与给定尺寸冲突时，以尺寸为准并报告冲突。
+`<out-dir>` 默认是 CDR 同目录下的 `<文件名>_work`。
 
-PDF 输入时，除非手上有原始 CDR，否则**不得**声称与源文件完全一致。
-先判断 PDF 内容构成：可提取矢量路径、嵌入位图、可提取文本，还是混合；
-把证据转成中间 CDR，记录转换限制，再走常规 CDR 校验流程。
+常用变体：
 
-## 源 CDR 流程
+```powershell
+# 用标准纸型（高度按纸型取，不按图比例推导）
+python scripts\cdr_bitmap_to_cdr.py --image ref.png --page-size A4 --output out\ref.cdr
 
-用户提供 CDR 时，按以下可重复流程执行：
+# 没有 CorelDRAW 也能跑：只描摹出 SVG 与清单
+python scripts\cdr_bitmap_to_cdr.py --image ref.png --page-width 210 ^
+  --output out\ref.cdr --trace-only
 
-1. **剖析源 CDR**
-   ```powershell
-   python scripts\cdr_prompt_builder.py --source input.cdr --output outputs\input-redraw-prompt.md
-   ```
-2. **审阅生成的定制提示词**
-   确认文件名、页面数、页面尺寸、图层表、形状类型分布、文本清单与风险提示。
-3. **创建精确重绘**
-   ```powershell
-   python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cdr --mode clone
-   ```
-4. **校验**
-   比较源与目标的页面数、每页图层数与图层名、每图层顶层形状数与形状总数、
-   全文档形状类型分布、文本内容与视觉版面。
+# 裁掉左侧扫描残留后重新标定
+python scripts\cdr_bitmap_to_cdr.py --image ref.png --page-width 210 ^
+  --output out\ref.cdr --crop-left 4
 
-## PDF 派生 CDR 流程
+# 自动分区不满意时手工指定（覆盖自动结果）
+python scripts\cdr_bitmap_to_cdr.py --image ref.png --page-width 210 ^
+  --output out\ref.cdr ^
+  --region "art:6,500,1217,900" ^
+  --region "logo:0,901,1217,1059,invert"
+```
 
-用户提供 PDF 且没有源 CDR 时使用。目标是从 PDF 证据得到可复现的 CDR 重绘，
-再以常规流程对中间 CDR 校验。
+## 位图矢量化流程（脚本内部六步）
 
-1. **检查 PDF 内容**
-   - 记录页数、页面尺寸、单位（若可知）、元数据、可提取文本数、嵌入位图数、
-     是否存在矢量绘制路径。
-   - 有矢量路径时优先用矢量路径，而非栅格描摹。
-   - PDF 以栅格为主时，高 DPI 渲染后当作视觉证据，而非精确源数据。
-2. **创建中间 CDR**
-   - 矢量 PDF：把路径转成 CDR 矢量对象，用页面尺寸或图纸尺寸标定单位。
-   - 栅格 / 混合 PDF：高 DPI 渲染 + 线稿矢量化 + 文本提取。只有可提取或经
-     OCR 确认的文本才写成真正的文本对象；否则保留为描摹几何或标记为不确定。
-   - 除非 PDF 或用户给出图层规范，否则使用通用图层：
-     `LINEWORK`、`TEXT`、`BORDER`、`DIM`、`CENTER`、`CONSTRUCTION`。
-   - 中间 CDR 另存为新文件，不覆盖 PDF 与任何原始 CDR。
-3. **剖析中间 CDR**
-   ```powershell
-   python scripts\cdr_prompt_builder.py --source intermediate.cdr --output outputs\intermediate-redraw-prompt.md
-   ```
-4. **用源 CDR 流程重建并校验**
-   ```powershell
-   python scripts\cdr_redraw.py --source intermediate.cdr --output outputs\redraw_from_pdf.cdr --mode clone
-   ```
-   校验应以中间 CDR 的计数与分布为准，同时把中间 CDR 与最终 CDR 都和原 PDF 做视觉比对。
-5. **报告转换限制**
-   说明几何来自矢量路径、栅格描摹、OCR / 文本提取还是推断；指出不可读文本、
-   不可编辑的描摹文本、近似曲线、缺失尺寸与任何比例假设。
+1. **标定**
+   `mm_per_px = 页面宽度mm / 图片宽度px`。核对图宽高比与页面宽高比——
+   不一致说明源图裁切过，纵向内容高度会与页面高度产生差异，必须在报告中说明
+   （实测 vonder 图：比例 0.7331 ≠ A4 的 0.7071，按宽度 210mm 标定后纵向内容
+   高 286.442mm，比页高少 10.6mm）。
+2. **边缘残留探测**
+   探测四周是否有扫描/裁切残留暗边。**这一步不能跳**，残留会污染后续分区：
+   贯穿全高的黑边条让**每一行**都含墨迹像素，行投影就永远找不到空隙，
+   分区会把本应分开的区块粘成一整块（实测 vonder 图左侧 4px 黑边条
+   把易碎标、插图、页脚粘成了一个 `y 0..901` 的大块）。
+   脚本用 `strip_residue()` 把贯穿边缘的行/列从**投影判定**里抹掉，
+   但**不复刻为设计内容**；要用 `--crop-left N` 才能真正裁掉并重新标定。
+3. **自动分区**
+   行投影切内容带 → 带内判定满版色带 → 色带之外再按行细切 → 列方向收紧与切分。
+   详见下节。
+4. **逐区阈值寻优 + 描摹**
+   每个区域扫若干二值化阈值，取 IoU 最高者。关键参数与陷阱见下节。
+5. **在 CorelDRAW 中重建**
+   建页、按类型建图层、导入 SVG、按毫米包围盒精确定位、附加垫底原生矩形、
+   保存 CDR、导出预览。**导入后必须逐项比对"目标坐标/尺寸 vs 实际坐标/尺寸"，
+   误差应 < 0.02 mm。**
+6. **配准式像素校验 + 报告**
+   把渲染图**贴回整页坐标系**后与源图逐像素比对，输出 IoU / 召回 / 精确
+   与差异叠加图。直接拿内容包围盒导出图与整页源图比是错的（会得到 ~12% 的
+   无意义 IoU）。同时算**墨迹面积比**判定笔画粗细。
 
-## 图片 + 尺寸流程
+## 自动分区怎么做的
 
-用户提供 PNG / JPG 参考图外加书面尺寸或参数表时使用。
+脚本用三个投影信号，按顺序判定：
 
-1. **归一化输入规格**
-   记录图片路径、单位、总体尺寸、重复模数尺寸、厚度、偏移、特征数量、内部布局、
-   所需视图、图层、标注、3D 需求、输出路径与容差。缺失值一律显式标为未知，不要静默猜测。
-2. **确定几何权威顺序**
-   先书面尺寸，再派生算术，最后图片比例。绘制前先确认净空与重复模数合计。
-3. **规划 CorelDRAW 构建**
-   优先用 VBA 做可审计的参数化构建；Python 只用于生成参数文件或编排 COM。
-   确定性地创建所需图层、文本 / 轮廓样式、群组与保存目标。
-4. **确定性绘制**
-   按"环境准备 → 主轮廓 → 内部几何 → 标注 → 效果"分阶段构建，保证同一参数产出同一文件。
-5. **校验并交付**
-   检查尺寸为正、算术合计正确、对象边界合理、无意外重叠、所需图层齐全、
-   形状 / 群组计数正确、最终 CDR 保存成功。与参考图做视觉比对，但不推翻权威尺寸。
+1. **行投影切内容带**：行内墨迹像素数 ≥ `min_ink_px`（默认 4）视为有效行；
+   有效行之间空白 < `min_gap_px`（默认 6）则合并；短于 `min_run_px`（默认 6）的段丢弃。
+2. **带内判定"满版色带"——必须用行的中位数灰度，不要用覆盖率。**
+   这是本流程最容易踩的坑：色带中间常被反白字标掏空，覆盖率会掉到 0.85 以下，
+   用覆盖率判定会把整条色带误判成普通内容区。
+   实测 vonder 图：
 
-### 最小参数规格
+   | 判定信号 | 结果 |
+   | --- | --- |
+   | 行覆盖率 ≥ 0.85 | 碎成 `901..960` + `1037..1059` 两段（错） |
+   | **行中位数 < 128** | **`901..1059` 整条**（对） |
+   | 行 25 分位 < 128 | 多出 `661..784` 假色带（插图密集区，错） |
 
-- 参考图片路径。
-- 单位系统与总体宽、高、深（若适用）。
-- 构件尺寸、厚度、偏移、数量与重复间距规则。
-- 所需视图、图层、标注、文本、群组。
-- 输出 CDR 路径。
-- 对尺寸未覆盖细节的显式假设与容差。
+   行中位数只看"这一行整体是深还是浅"，不受中间被掏空影响。
+3. **色带拆成两件事**：
+   - 垫底的**原生矢量矩形**（颜色从源图暗像素的 RGB 中位数取，实测 vonder 得 `#121011`）
+   - 同一框内的**反白描摹**（`invert=True`，描出白字标）
 
-## 位图矢量化流程
+   色带的横向范围用**未剥离残留**的墨迹算——满版底色本来就该顶到页边，
+   残留剥离只用于"哪里是内容"的判定，不该把色带缩进去。
+4. **列方向收紧 + 切分**：列间空隙超过 `col_gap_frac * 图宽`（默认 0.05）时切分，
+   `--no-split` 可关。色带不切，保持满版矩形。
+5. **命名**：色带 `band01`（其反白描摹叫 `band01_ink`），其余按形状猜语义——
+   高度 < 6mm 叫 `text`，宽 < 60mm 且高 < 40mm 叫 `mark`，其余叫 `art`。
+   **这只是命名启发式，不代表真实语义**，可用 `--region` 覆盖。
 
-用户给的是位图（PNG/JPG 截图、扫描件、设计稿导出图），要求"照着这张图在 CDR 里画出来"时使用。
-目标是把栅格内容还原成**可编辑的矢量 CDR**，并用配准式像素比对证明还原度。
+实测 vonder 图自动分区与手工调优结果对照：
 
-1. **标定并探测边缘**
-   `mm_per_px = 页面宽度mm / 图片宽度px`。核对图宽高比与页面宽高比是否一致——
-   不一致说明源图裁切过，纵向内容高度会与页面高度产生差异，必须在报告中说明。
-   同时探测四周是否有扫描/裁切残留暗边（如贯穿全高的黑边条），
-   用 `--crop-left` 之类排除，**不要复刻成设计内容**。
-2. **分区**
-   按内容性质切块，每块单独描摹：满版色块用原生矩形、精细线稿、深底反白字标（invert）、小字。
-   可用 `--auto` 按投影快速摸底，正式交付手工给 `--region`。
-3. **调参描摹**
-   先跑 `--probe` 扫参数，再正式生成。关键参数：
-   - `--upscale`（默认 8）：**描摹前对灰度做 LANCZOS 上采样再二值化**。
-     这是细部保真的关键——原分辨率直接二值化会把小图标的平顶圆滑成尖拱、
-     细笔画简化成折线。实测 U=4 得 95.2%、U=8 得 98.3%。
-   - `--alphamax`（默认 1.0）：0 会让 potrace 输出**纯多边形**（圆角变折线），
-     且其像素 IoU 反而最高——只看 IoU 会选出视觉最差的结果。
-     必须同时数 SVG 里 `C`（曲线段）与 `L`（直线段）的数量。
-   - `--threshold`（默认 128）：二值化阈值，**直接决定笔画粗细**。
-     细笔画文字（6pt 级）对阈值很敏感，用 `--probe` 扫 110~150。
-   - `--turdsize`：斑点面积阈值，按源图像素给，内部按 `upscale²` 折算。
-   挑各区域 IoU 最高的组合，再正式生成 SVG 与 `manifest.json`。
-4. **在 CorelDRAW 中重建**
-   用 `cdr_image_place.py` 建页、建图层、导入 SVG 并按清单尺寸与包围盒精确定位，
-   附加原生矢量矩形，保存 CDR 并导出预览。
-   **导入后必须逐项比对"目标坐标/尺寸 vs 实际坐标/尺寸"，误差应 < 0.02 mm。**
-5. **配准校验**
-   用 `cdr_visual_diff.py` 把渲染图**贴回整页坐标系**后与源图逐像素比对。
-   直接拿内容包围盒导出图与整页源图比是错的（会得到 ~12% 的无意义 IoU）。
-   输出 IoU / 召回 / 精确与差异叠加图；召回低 = 漏画，精确低 = 多画或笔画变粗。
+| 区域 | 自动分区 | 手工调优 | 判定 |
+| --- | --- | --- | --- |
+| 色带 | mm 0.000,155.472..210.000,182.736 | 0,155.472..210,182.736 | 一致 |
+| 插图 | mm 56.253,96.631..170.312,152.539 | 56.253,96.545..170.291,152.604 | 一致 |
+| 易碎标 | mm 152.539,59.532..194.988,75.924 | 152.474,59.596..195.074,75.924 | 一致 |
+| 页脚 | mm 81.274,186.878..145.292,189.121 | 81.252,186.921..145.249,189.703 | 一致 |
 
-   **判断笔画粗细不要靠眼睛，要算墨迹面积比**（与分辨率无关）：
-   矢量几何面积（按 60 px/mm 光栅化数像素）÷ 源图墨迹面积。
-   比值落在 0.98~1.02 就说明粗细吻合。
-   注意：把导出图降采样到源图尺寸后再阈值化会虚增细笔画，实测能把 1.00 放大成 1.39。
+## 描摹参数与陷阱
 
-   **给用户看的对照图必须同尺度**：源图原生密度（如 5.795 px/mm）与导出密度
-   （如 11.81 px/mm）不同，直接并排会让人以为重绘又大又粗。
-   先把两者重采样到同一 px/mm 再并排。
-6. **交付说明**
-   报告 CDR 路径、内容构成、各区域还原度、已知偏差及其来源
-   （哪些是描摹近似、哪些是源图残留未复刻、哪些是小字天然失真）。
+先跑 `--trace-only` 摸底（不需要 CorelDRAW），确认分区与各区域 IoU 后再正式建 CDR。
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--upscale` | 8 | **描摹前对灰度做 LANCZOS 上采样再二值化**。细部保真的关键：原分辨率直接二值化会把小图标的平顶圆滑成尖拱、细笔画简化成折线。实测 U=4 得 95.2%、U=8 得 98.3% |
+| `--threshold` | 逐区寻优 | 二值化阈值，**直接决定笔画粗细**。细笔画文字（6pt 级）对它极敏感：页脚在 118 处 IoU 有明显峰值，不是越接近 128 越好。给了该参数就不寻优 |
+| `--tune-thresholds` | 112,118,128,138,148 | 寻优候选。面积 > `--max-tune-px`（默认 400k 源像素）的区域只扫 3 个以控时 |
+| `--alphamax` | 1.0 | **不要用 0**。0 会让 potrace 输出纯多边形（圆角变折线），而它的像素 IoU 反而最高——只看 IoU 会选出视觉最差的结果。脚本会先只在"有真实曲线段"的候选里选 |
+| `--turdsize` | 2 | 斑点面积阈值，单位是**源图像素**，内部按 `upscale²` 折算 |
+| `--opttolerance` | 0.1 | 曲线优化容差，越大越简并 |
+
+其他实现细节（potracer 的 invert 约定、evenodd、`Z M` 分隔符、反白区域要剔除
+接触裁剪边界的白色连通域）见 `references/raster-to-vector-notes.md`，那份文档
+是实测踩坑结论，照做可以省掉大量试错。
+
+## 判断还原度：不要靠眼睛
+
+**对照图必须同尺度。** 源图原生密度（如 5.795 px/mm）与 CorelDRAW 导出密度
+（如 11.81 px/mm）不同，直接把同一毫米范围的裁切按同倍数并排，导出侧字面会
+大一圈，让人以为重绘又大又粗——这是纯尺度假象。
+
+**判断笔画粗细要算墨迹面积比**（与分辨率无关）：
+矢量几何面积（按 60 px/mm 光栅化数像素）÷ 源图墨迹面积。
+比值落在 **0.98~1.02** 就说明粗细吻合。
+
+> 反面教训：把导出图降采样回源图尺寸再阈值化，抗锯齿边缘会被算成墨迹，
+> 细笔画被补边，实测能把 1.00 放大成 1.39，凭空报出"页脚偏粗 39%"的假结论。
+
+达标参考（vonder 图，U=8 + 逐区寻优后）：
+
+| 区域 | 原生分辨率 IoU | 面积比 |
+| --- | --- | --- |
+| vonder 字标 | 99.51% | 0.999 |
+| Fragile 易碎标 | 98.25% | 1.001 |
+| 工具群插图 | 97.55% | 1.007 |
+| 6pt 页脚文字 | 93.81% | 0.993 |
+| **整页配准** | **93.48%**（召回 95.33% / 精确 97.97%） | — |
+
+## 交付说明必写
+
+- 报告 CDR 路径、内容构成、各区域还原度、已知偏差及其来源
+  （哪些是描摹近似、哪些是源图残留未复刻、哪些是小字天然失真）。
+- **绝不把描摹结果说成"原始矢量"**，明确标注哪些是描摹近似。
+- 源图边缘的扫描/裁切残留**不得复刻为设计内容**，但必须在交付说明中提及，
+  避免被误判为漏画。
+- 不得声称与源文件"完全一致"；应给出配准指标（IoU / 召回 / 精确）与已知偏差。
+- 保留参数块或参数文件（`manifest.json` / `report.json`），
+  使文件可用变更后的尺寸重新生成。
+
+## 其他输入模式
+
+主用途之外，本技能也覆盖以下场景（与 AutoCAD 的 `autocad-dwg-redraw` 技能同构：
+**剖析 → 生成提示词 → 重建 → 校验**，区别在于操作对象是 CorelDRAW 的
+文档/页面/图层/形状模型，而非 DWG 的 ModelSpace/PaperSpace）：
+
+### 源 CDR 模式
+
+源 CDR 可用时，**不要**仅凭截图或视觉风格去推断。先提取或复制真实形状，
+再与原始文件校验。最终交付优先用形状级精确复制（`Shape.CopyToLayer`）。
+
+```powershell
+python scripts\cdr_prompt_builder.py --source input.cdr --output outputs\input-redraw-prompt.md
+python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cdr --mode clone
+```
+
+### PDF 派生模式
+
+没有源 CDR 时使用。先判断 PDF 内容构成：可提取矢量路径、嵌入位图、可提取文本，
+还是混合。有矢量路径时优先用矢量路径而非栅格描摹。
+**除非手上有原始 CDR，否则不得声称与源文件完全一致。**
+
+### 图片 + 尺寸模式
+
+用户给参考图外加书面尺寸或参数表时使用。把用户给出的尺寸、单位、数量与版面约束
+视为权威；像素只用于判断拓扑、顺序与视觉关系。当图片与给定尺寸冲突时，
+以尺寸为准并报告冲突。**绝不用图片比例替代给定的数值尺寸。**
+
+最小参数规格：参考图片路径；单位系统与总体宽高深；构件尺寸、厚度、偏移、数量与
+重复间距规则；所需视图、图层、标注、文本、群组；输出 CDR 路径；
+对尺寸未覆盖细节的显式假设与容差。
 
 ## 重绘提示词标准
 
@@ -172,24 +219,18 @@ PDF 输入时，除非手上有原始 CDR，否则**不得**声称与源文件�
 - 校验标准：页面数、图层名集合、顶层形状数、形状总数、类型分布、文本内容、视觉版面。
 - 已知风险：精简版缺 COM 注册、效果被简化、位图断链、字体缺失、跨文档 `CopyToLayer` 版本差异。
 
-手动撰写定制提示词时，以 `references/prompt-template.md` 为模板。
-有 CorelDRAW COM 可用时，优先用 `scripts/cdr_prompt_builder.py` 自动生成。
+手动撰写时以 `references/prompt-template.md` 为模板；有 CorelDRAW COM 可用时
+优先用 `scripts/cdr_prompt_builder.py` 自动生成。
 
 ## 精度要求
 
 - 复制全部页面与全部图层，除非用户明确要求仅处理某页或某图层。
 - 保留文本、位图、群组、表格、度量、艺术笔、符号、网状填充、填充、轮廓、效果与对象数据。
 - 源文件含有的文本、群组或效果若在目标中缺失，视为校验失败。
-- 不覆盖源 CDR。始终写入新的输出路径（脚本会自动为已存在的路径追加时间戳）。
+- 不覆盖源文件。始终写入新的输出路径。
 - 文件使用链接位图、自定义效果或跨文档引用时，报告风险并在 CorelDRAW 中做视觉校验。
-- PDF 派生模式中，明确区分精确矢量转换、栅格 / 矢量描摹、文本提取 / OCR 与推断几何。
-- 不得把 PDF 派生的中间 CDR 说成原始 CDR 的精确副本。
+- 位图矢量化模式中，导入后必须逐项比对目标坐标/尺寸与实际值，误差 < 0.02 mm。
 - 图片 + 尺寸模式中，拒绝非正尺寸、越界构件、无法解释的重叠与不符合总体尺寸的算术合计。
-- 绝不用图片比例替代给定的数值尺寸。
-- 位图矢量化模式中，绝不把描摹结果说成"原始矢量"；明确标注哪些是描摹近似。
-- 源图边缘的扫描/裁切残留不得复刻为设计内容，但必须在交付说明中提及，避免被误判为漏画。
-- 不得声称与源文件"完全一致"；应给出配准指标（IoU / 召回 / 精确）与已知偏差。
-- 保留参数块或参数文件，使文件可用变更后的尺寸重新生成。
 
 ## CorelDRAW 稳定性说明
 
@@ -217,8 +258,16 @@ PDF 输入时，除非手上有原始 CDR，否则**不得**声称与源文件�
 - **`ExportEx` 在 X8 上"返回成功但不写文件"**：以 `Export` 为主，
   且必须用 `os.path.exists` + 文件大小确认，不能只看有没有抛异常。
 - `page.Shapes.All` 是**方法**：写 `page.Shapes.All().Count`。
-- `Layer.Import` **不返回形状对象**，导入的形状追加到图层末尾：
-  取 `lay.Shapes.Item(lay.Shapes.Count)`，并比对导入前后 `Count` 是否增加。
+- **`Layer.Import` 不返回形状对象，而且把新形状插到图层"底部"（索引 1），
+  不是追加到末尾。** 所以**不能盲取 `Item(Count)`**：如果图层里已有形状
+  （例如同一图层先放了垫底矩形），`Item(Count)` 会取到那个旧形状，于是把新形状
+  的目标尺寸/位置/填充写到旧形状上——表现为两个形状属性互换。
+  实测后果：色带矩形拿到字标的几何、字标拿到矩形的深色填充，导出图里整条
+  色带消失、字标变成黑字。
+  定位新形状要用"导入前后名称集合的差"；最省事的做法是**一个区域一个图层**，
+  让导入时图层为空，索引就没有歧义。
+- 矩形也要验：`CreateRectangle2` 的参数语义在各版本间有差异，
+  只打印请求值而不核对 `PositionX/SizeWidth` 会掩盖错误。
 - **y 轴向上**，设计稿以左上为原点：
   `doc.ReferencePoint = 3`（cdrTopLeft）后，`shape.SetPosition(x_mm, page_h - y_top_mm)`。
 - 常量实测值：`cdrMillimeter = 3`（不是 4）、`cdrPortrait = 0`、`cdrTopLeft = 3`、
@@ -226,8 +275,7 @@ PDF 输入时，除非手上有原始 CDR，否则**不得**声称与源文件�
 - **`Document.Unit` 不随文件保存**：设成毫米并保存后，重新打开会回到英寸（1）。
   几何数据本身是绝对单位、不受影响，只是显示/读值单位变了。
   读坐标前先 `doc.Unit = 3`，否则拿到的是英寸数值。
-- `Application.ActiveDocument` 是**只读属性**，不能赋值；
-  要切换活动文档用 `doc.Activate()`。
+- `Application.ActiveDocument` 是**只读属性**，不能赋值；要切换活动文档用 `doc.Activate()`。
 - **`SaveAs` / `Export` 会按 CorelDRAW 自己的工作目录解析相对路径**，
   必须先把输出路径转成绝对路径，否则文件会落到意外位置。
 - 新建文档自带"图层 1"，直接改名复用，否则会多出一个空图层。
@@ -238,8 +286,7 @@ PDF 输入时，除非手上有原始 CDR，否则**不得**声称与源文件�
 
 - 页面：`Page.Name`、`SizeWidth/SizeHeight`、`Orientation`。
 - 图层：`Layer.Name`、`Visible`、`Editable`、`Printable`、`Color`。
-- 形状：`Type`、`Name`、`PositionX/PositionY`、`SizeWidth/SizeHeight`、
-  `CenterX/CenterY`、`Rotation`。
+- 形状：`Type`、`Name`、`PositionX/PositionY`、`SizeWidth/SizeHeight`、`CenterX/CenterY`、`Rotation`。
 - 曲线：`Curve.SubPaths` → `SubPath.Segments` → `Segment.StartNode/EndNode`、
   控制柄位置与角度、`SubPath.Closed`。
 - 文本：`Text.Type`、`Text.Story`、字体、字号、对齐、字距、行距。
@@ -252,39 +299,29 @@ PDF 输入时，除非手上有原始 CDR，否则**不得**声称与源文件�
 
 ## 附带脚本
 
-用 `scripts/cdr_prompt_builder.py` 生成文件专属提示词：
+### 主入口（位图 → CDR）
 
-```powershell
-python scripts\cdr_prompt_builder.py --source input.cdr --output outputs\input-redraw-prompt.md
-python scripts\cdr_prompt_builder.py --source input.cdr --progid CorelDRAW.Application.18
+`scripts/cdr_bitmap_to_cdr.py` —— 一条命令跑完全流程。参数见 `--help`。
+
+```text
+python scripts\cdr_bitmap_to_cdr.py --image ref.png --page-width 210 --output out\ref.cdr
+python scripts\cdr_bitmap_to_cdr.py --image ref.png --page-size A4 --output out\ref.cdr --trace-only
 ```
 
-用 `scripts/cdr_redraw.py` 做确定性重建与校验：
-
-```powershell
-python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cdr --mode clone
-python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_copy.cdr --mode duplicate
-python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cdr --report outputs\validation.json
-```
-
-用 `scripts/cdr_common.py` 复用连接、重试、遍历与统计逻辑（被上面两个脚本导入）。
-
-### 位图矢量化三件套
+### 位图矢量化三件套（主入口内部会调用，也可单独用）
 
 `scripts/cdr_image_trace.py` —— 标定 + 分区 + 描摹 + 参数寻优：
 
-```powershell
+```text
 # 正式生成：显式给区域（坐标是源图像素，左上原点）
 python scripts\cdr_image_trace.py --image ref.png --page-width 210 --out svg ^
   --region "art_tools:6,500,1217,900" ^
-  --region "logo_vonder:0,901,1217,1059,invert" ^
-  --region "mark_fragile:876,338,1137,447" ^
-  --region "text_footer:440,1075,870,1106"
+  --region "logo_vonder:0,901,1217,1059,invert"
 
 # 参数寻优：扫上采样倍数与 potrace 参数，输出各区域 IoU 最优组合
 python scripts\cdr_image_trace.py --image ref.png --page-width 210 --out svg --probe
 
-# 自动分区摸底（正式交付仍建议手工给 --region）
+# 自动分区摸底
 python scripts\cdr_image_trace.py --image ref.png --page-width 210 --out svg --auto
 ```
 
@@ -292,47 +329,49 @@ python scripts\cdr_image_trace.py --image ref.png --page-width 210 --out svg --a
 
 `scripts/cdr_image_place.py` —— 按清单在 CorelDRAW 中重建：
 
-```powershell
+```text
 python scripts\cdr_image_place.py --manifest svg\manifest.json ^
   --output out\cover.cdr --preview out\cover_preview.png ^
   --rect "band:0,155.472,210,27.264,#111111" ^
+  --rect-layer BAND --layer-order "BAND,MARK,ART,TEXT" ^
   --layer "logo_vonder=LOGO" --white logo_vonder
 ```
 
 产出 CDR、预览 PNG 与 `placement.json`（含各元素实际定位误差与内容包围盒）。
+注意：`--rect-layer` 指定的名字**必须出现在 `--layer-order` 里**，
+否则矩形无处安放会报 KeyError。
 
 `scripts/cdr_visual_diff.py` —— 配准式像素校验：
 
-```powershell
+```text
 python scripts\cdr_visual_diff.py --source ref.png ^
   --render out\cover_preview.png --placement out\placement.json --out compare
 ```
 
 产出整页 IoU / 召回 / 精确、分区域指标、差异叠加图与放大对照图。
 
-三个脚本依赖：
+### CDR 剖析与重建
 
-```powershell
-python -m pip install numpy opencv-python pillow potracer pywin32
+```text
+python scripts\cdr_prompt_builder.py --source input.cdr --output outputs\input-redraw-prompt.md
+python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cdr --mode clone
 ```
 
-用 `scripts/selftest_offline.py` 在**没有 CorelDRAW 的环境**下做离线冒烟测试，
-验证提示词渲染与校验比对逻辑（用桩模块替代 pywin32）：
+`scripts/cdr_common.py` 提供连接、重试、遍历与统计逻辑（被上述脚本导入）。
 
-```powershell
-python scripts\selftest_offline.py
-```
+### 依赖与自检
 
-脚本要求 Windows、CorelDRAW X8 或更高、Python 3.10+ 与 `pywin32`：
-
-```powershell
-python -m pip install pywin32
+```text
+python -m pip install numpy opencv-python pillow potracer
+python -m pip install pywin32          # 只有要建 CDR 时才需要
+python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线冒烟测试
 ```
 
 ## 参考文档
 
-- `references/prompt-template.md`：定制提示词的完整模板与骨架。
-- `references/coreldraw-object-model.md`：CorelDRAW X8 COM 对象模型、枚举与跨文档复制要点。
 - `references/raster-to-vector-notes.md`：**位图矢量化必读**。potracer 的 invert 约定、
   evenodd、`Z M` 分隔符、上采样对细部保真的影响、`alphamax=0` 的多边形陷阱、
-  X8 的 `ExportEx` 缺陷、配准校验方法与交付自查清单。
+  阈值决定笔画粗细、用面积比判粗细、对照图必须同尺度、X8 的 `ExportEx` 缺陷、
+  配准校验方法与交付自查清单。
+- `references/coreldraw-object-model.md`：CorelDRAW X8 COM 对象模型、枚举与跨文档复制要点。
+- `references/prompt-template.md`：定制提示词的完整模板与骨架。

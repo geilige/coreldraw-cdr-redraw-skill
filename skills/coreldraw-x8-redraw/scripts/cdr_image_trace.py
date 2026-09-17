@@ -233,19 +233,50 @@ def _subpaths(d):
     return subs
 
 
-def rasterize(svg_text, out_w, out_h, sub_px, ox, oy):
-    """把 SVG 光栅化到源像素网格。even-odd 填充 == 各子路径覆盖区异或。"""
+def rasterize(svg_text, out_w, out_h, sub_px, ox, oy, ss=8):
+    """把 SVG 光栅化到源像素网格。even-odd 填充 == 各子路径覆盖区异或。
+
+    ss>1 时先按 ss 倍超采样，再盒式降采样得到**覆盖率**（0..1）而非硬边布尔。
+    **必须用超采样，不要退回硬边**：cv2.fillPoly 是"取整后填充"，
+    会系统性低估矢量覆盖面积（sub-pixel 偏差），造成"笔画越粗 IoU 越高"的
+    单调偏差，寻优会一路选到最粗的阈值。实测同一区域（band 反白字标）：
+
+        阈值   硬边 IoU%   超采样 IoU%   超采样面积比
+        128     94.15       99.40        1.005
+        138     94.29       99.51        1.000   <- 真峰
+        148     94.34(最高) 99.35        0.996
+
+    硬边把最优判成 148，超采样判成 138；而 CorelDRAW 实际导出比对是 99.15%，
+    说明超采样才贴近真实。偏差是 sub-pixel 效应，在远高于源图密度的网格上
+    （如 60 px/mm 数面积）可以忽略，但在源图原生网格上不能忽略。
+    """
     m = re.search(r'viewBox="([^"]+)"', svg_text)
     vx, vy = (float(v) for v in m.group(1).split()[:2])
-    acc = np.zeros((out_h, out_w), np.uint8)
+    W, H = out_w * ss, out_h * ss
+    acc = np.zeros((H, W), np.uint8)
     for poly in _subpaths(re.search(r'\sd="([^"]+)"', svg_text).group(1)):
         q = poly.copy()
-        q[:, 0] = (q[:, 0] - vx + ox) * sub_px
-        q[:, 1] = (q[:, 1] - vy + oy) * sub_px
-        layer = np.zeros((out_h, out_w), np.uint8)
-        cv2.fillPoly(layer, [np.round(q).astype(np.int32)], 1)
-        acc ^= layer
-    return acc.astype(bool)
+        q[:, 0] = (q[:, 0] - vx + ox) * sub_px * ss
+        q[:, 1] = (q[:, 1] - vy + oy) * sub_px * ss
+        # 只为该子路径分配它自己的包围盒画布，再异或回总画布。
+        # 这步不能省：整幅分配的话，ss=8 下一个 483 子路径的区域要
+        # 483 × (5288 × 2592) ≈ 66 亿次像素操作，根本跑不完；
+        # 局部化后绝大多数子路径只占几十像素见方，代价降几个数量级。
+        bx0 = max(0, int(np.floor(q[:, 0].min())))
+        by0 = max(0, int(np.floor(q[:, 1].min())))
+        bx1 = min(W, int(np.ceil(q[:, 0].max())) + 1)
+        by1 = min(H, int(np.ceil(q[:, 1].max())) + 1)
+        if bx1 <= bx0 or by1 <= by0:
+            continue
+        lay = np.zeros((by1 - by0, bx1 - bx0), np.uint8)
+        qq = np.round(q).astype(np.int32)
+        qq[:, 0] -= bx0
+        qq[:, 1] -= by0
+        cv2.fillPoly(lay, [qq], 1)
+        acc[by0:by1, bx0:bx1] ^= lay
+    if ss == 1:
+        return acc.astype(bool)
+    return acc.reshape(out_h, ss, out_w, ss).mean(axis=(1, 3))
 
 
 def svg_viewbox(svg_text):
@@ -261,8 +292,9 @@ def evaluate(src, y0, y1, x0, x1, invert, upscale, turdsize, alphamax,
                                y0 * upscale, turdsize, alphamax, opttolerance)
     ref = region_mask(src, y0, y1, x0, x1, invert, 1)
     vx, vy = svg_viewbox(svg)[:2]
-    acc = rasterize(svg, x1 - x0, y1 - y0, 1.0 / src.mm_per_px,
-                    vx - x0 * src.mm_per_px, vy - y0 * src.mm_per_px)
+    cov = rasterize(svg, x1 - x0, y1 - y0, 1.0 / src.mm_per_px,
+                    vx - x0 * src.mm_per_px, vy - y0 * src.mm_per_px, ss=8)
+    acc = cov >= 0.5                      # 超采样覆盖率过半即算墨迹
     inter, union = (acc & ref).sum(), (acc | ref).sum()
     return {
         "iou": round(inter / union * 100, 2) if union else 100.0,

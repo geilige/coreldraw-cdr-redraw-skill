@@ -29,8 +29,12 @@ CorelDRAW X8 上的实测要点（改动前先读）
    SetPosition(x, y) 就是"左上角坐标"。
 7. **CorelDRAW 的 y 轴向上**，而设计稿习惯以左上为原点。转换：
        y_cdr = page_height_mm - y_top_mm
-8. Layer.Import 不返回形状对象，导入的形状会**追加到该图层末尾**。
-   取回方式：lay.Shapes.Item(lay.Shapes.Count)，并用导入前后 Count 是否增加来校验。
+8. **Layer.Import 不返回形状对象，而且它把新形状插到图层"底部"（索引 1），
+   不是追加到末尾。** 所以**不能盲取 `Item(Count)`**：如果图层里已有形状
+   （比如同一个图层里先放了垫底矩形），`Item(Count)` 会取到那个旧形状，
+   于是把新形状的目标尺寸/位置/填充写到旧形状上——表现为两个形状属性互换。
+   定位新形状要用"导入前后名称集合的差"，见 `_find_new_shape()`。
+   最省事的做法是**一个区域一个图层**，让导入时图层是空的，索引无歧义。
 9. 集合索引是 **1 基**：Shapes(1)、Pages(1)、Layers(1)。
 10. page.Shapes.All 是**方法**，要写成 page.Shapes.All().Count。
 11. 批量操作前 app.Optimization = True、app.EventsEnabled = False；
@@ -81,6 +85,27 @@ def parse_map(specs):
     return out
 
 
+def _layer_shape_names(lay):
+    """返回 {索引: 名称}，索引 1 基。"""
+    return {i: str(lay.Shapes.Item(i).Name)
+            for i in range(1, lay.Shapes.Count + 1)}
+
+
+def _find_new_shape(lay, before_names):
+    """导入后定位新形状。
+
+    X8 的 Layer.Import 把新形状插到图层**底部（索引 1）**，不是追加到末尾，
+    所以 `Item(Count)` 只在"导入前图层是空的"时才碰巧正确。
+    这里用导入前后名称集合的差来定位，对插入位置不敏感。
+    返回 (shape, 索引)；定位不唯一时回退到末尾并返回 None 索引。
+    """
+    after = _layer_shape_names(lay)
+    added = [i for i, nm in after.items() if nm not in set(before_names.values())]
+    if len(added) == 1:
+        return lay.Shapes.Item(added[0]), added[0]
+    return lay.Shapes.Item(lay.Shapes.Count), None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="按描摹清单在 CorelDRAW 中构建 CDR",
@@ -93,6 +118,10 @@ def main(argv=None):
     ap.add_argument("--rect", action="append", default=[],
                     help="附加原生矢量矩形 name:x,y,w,h,#RRGGBB（y 为距页顶毫米），"
                          "可重复，按给定顺序先画（垫底）")
+    ap.add_argument("--rect-layer", default="RECT",
+                    help="承载 --rect 矩形的图层名（默认 RECT）。"
+                         "配合 --layer-order 时，该名必须出现在 order 里，"
+                         "否则矩形无处安放会报 KeyError")
     ap.add_argument("--layer", action="append", default=[],
                     help="图层映射 区域名=图层名，可重复；缺省用区域名大写")
     ap.add_argument("--white", action="append", default=[],
@@ -143,7 +172,7 @@ def main(argv=None):
     if args.layer_order:
         order = [t.strip() for t in args.layer_order.split(",") if t.strip()]
     else:
-        order = ["RECT"] + [layer_map.get(n, n.upper()) for n in regions]
+        order = [args.rect_layer] + [layer_map.get(n, n.upper()) for n in regions]
 
     out_dir = os.path.dirname(args.output)
     os.makedirs(out_dir, exist_ok=True)
@@ -207,15 +236,28 @@ def main(argv=None):
     placed = []
 
     for name, r in rects:
-        lay = layers["RECT"]
+        lay = layers[args.rect_layer]
+        doc.ReferencePoint = CDR_TOPLEFT
         sh = lay.CreateRectangle2(r["x"], cdr_y(r["y"] + r["h"]), r["w"], r["h"])
         sh.Fill.ApplyUniformFill(app.CreateRGBColor(*r["rgb"]))
         sh.Outline.SetNoOutline()
         sh.Name = name
+        # 矩形也要验：CreateRectangle2 的参数语义在各版本间有差异，
+        # 只打印请求值而不核对实际值会掩盖错误（本脚本曾经因此漏掉一个 bug）。
+        doc.ReferencePoint = CDR_TOPLEFT
+        ax, ay = sh.PositionX, page_h - sh.PositionY
+        ex, ey = abs(ax - r["x"]), abs(ay - r["y"])
+        ew = abs(sh.SizeWidth - r["w"])
+        eh = abs(sh.SizeHeight - r["h"])
+        flag = "OK" if max(ex, ey, ew, eh) < 0.02 else "偏差"
         placed.append({"name": name, "kind": "rect", "layer": lay.Name,
-                       "bbox_mm": [r["x"], r["y"], r["x"] + r["w"], r["y"] + r["h"]]})
-        print(f"{name:14s} 矩形 x{r['x']:8.3f} y{r['y']:8.3f} "
-              f"{r['w']:7.3f}x{r['h']:7.3f}")
+                       "bbox_mm": [r["x"], r["y"], r["x"] + r["w"], r["y"] + r["h"]],
+                       "error_mm": [round(ex, 4), round(ey, 4)]})
+        print(f"{name:14s} 矩形 目标 x{r['x']:8.3f} y{r['y']:8.3f} "
+              f"{r['w']:7.3f}x{r['h']:7.3f}  |  "
+              f"实际 x{ax:8.3f} y{ay:8.3f} "
+              f"{sh.SizeWidth:7.3f}x{sh.SizeHeight:7.3f}  "
+              f"误差 {ex:.3f}/{ey:.3f} mm  [{flag}]")
 
     print()
     for key, info in regions.items():
@@ -229,12 +271,16 @@ def main(argv=None):
             print(f"{key:14s} [跳过] 找不到 {svg}")
             continue
 
-        before = lay.Shapes.Count
-        lay.Import(svg, 0, None)          # 要点 2/8
-        if lay.Shapes.Count == before:
+        before_n = lay.Shapes.Count
+        before_names = _layer_shape_names(lay)
+        lay.Import(svg, 0, None)          # 要点 2
+        if lay.Shapes.Count == before_n:
             print(f"{key:14s} [失败] 导入后图层形状数未增加")
             continue
-        sh = lay.Shapes.Item(lay.Shapes.Count)
+        sh, new_idx = _find_new_shape(lay, before_names)   # 要点 8
+        if new_idx is None:
+            print(f"{key:14s} [警告] 无法唯一定位新形状（图层内已有同名形状？），"
+                  f"回退到图层末尾；建议一个区域一个图层")
 
         tw, th = info["size_mm"]
         sh.SetSize(tw, th)
