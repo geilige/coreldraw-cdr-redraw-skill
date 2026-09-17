@@ -647,3 +647,158 @@ Fragile 标提升最大的原因是酒杯图标由明显失真恢复为完全正
 读清单时缺字段要显示 `—` 而不是 0：0 会被误读成"完全不像"，
 而真实含义是"这一版清单还没记录"。同理，若清单没有 `rects`（旧版），
 满版色带的垫底矩形可由该区域的 `bbox_mm` 反推，报告不至于缺段。
+
+---
+
+## 9. 内置 PowerTRACE 能不能替代自研描摹（X8 实测）
+
+### 9.0 ⚠️ 先记一次判断错误：这两条结论我都写错过
+
+第一轮实测的结论是"`Finish()` 不产出矢量""`Smoothing`/`DetailLevel` 参数被忽略"。
+**两条都是错的**，错因很典型，值得留在文档里当反面教材：
+
+- **计数口径漏了一类对象。** 我的统计只看了 `s.Type == 3`（曲线），而
+  `Finish()` 的产物是 `cdrGroupShape = 7`（群组），整个被漏掉——于是
+  "形状总数没变"被读成了"没产出矢量"。正确做法是**递归展开群组再数**。
+- **挑了恰好同档的两个参数值去比。** `Smoothing`/`DetailLevel` 是 0–255 刻度，
+  实测 0→13780 节点、64→1593、128→2711、160→2711。128 与 255 落进同一个档位，
+  结果自然相同，于是被误判成"参数不生效"。
+
+**教训：判"某功能无效"之前，先确认自己的探针能看见它。** 计数口径漏一类对象、
+参数取样撞在同一个档位上，结论就会整个反过来——而且看起来还挺"有证据"。
+
+### 9.1 枚举真值（从 `vgcoreauto.tlb` 读出，不要凭记忆写）
+
+```
+cdrShapeType: 0 NoShape / 1 Rectangle / 2 Ellipse / 3 Curve / 4 Polygon
+              5 Bitmap / 6 Text / 7 Group / 8 Selection / 9 Guideline
+              10 BlendGroup / 11 ExtrudeGroup / 12 OLEObject / 13 ContourGroup
+              14 LinearDimension / 15 BevelGroup / 16 DropShadowGroup
+              17 3DObject / 18 ArtisticMediaGroup / 19 Connector / 20 MeshFill
+              21 Custom / 22 CustomEffectGroup / 23 Symbol / 24 HTMLFormObject
+              25 HTMLActiveObject / 26 Perfect / 27 EPS
+cdrTraceType: 1 LineArt / 2 Logo / 3 DetailedLogo / 4 Clipart
+              5 LowQualityImage / 6 HighQualityImage / 7 Technical / 8 LineDrawing
+cdrColorType: 5 RGB / 8 BlackAndWhite / 9 Gray
+```
+
+注意 **`cdrBitmapShape = 5`（不是 7）、`cdrTextShape = 6`、`cdrGroupShape = 7`**。
+`cdrColorBlackAndWhite` 属 `cdrColorType`，传进 `Trace` 的 `ColorMode` 会报
+"类型不匹配"；黑白描摹传 `cdrColorRGB = 5` 可正常预览。
+
+### 9.2 接口：`Trace` 挂在 Bitmap 上，不在 Shape 上
+
+```python
+shp = lay.Shapes.Item(lay.Shapes.Count)
+ts = shp.Bitmap.Trace(trace_type, smoothing, detail_pct, color_mode,
+                      palette_id, color_count,
+                      True,    # DeleteOriginalObject
+                      True,    # RemoveBackground
+                      False)   # RemoveEntireBackColor
+print(ts.CurveCount, ts.NodeCount)   # 预览，此时页面上还没有矢量
+ts.Finish()                          # 提交：原位图被替换成**一个群组**
+```
+
+签名（从 `vgcoreauto.tlb` 导出，memid 1610743840）：
+
+```
+IVGBitmap.Trace(TraceType, Smoothing, DetailLevelPercent, ColorMode, PaletteID,
+                ColorCount, DeleteOriginalObject, RemoveBackground,
+                RemoveEntireBackColor) -> TraceSettings
+```
+
+探路时踩到的坑：
+
+- 直接写 `Shape.Trace(...)` 报 `IVGShape object has no attribute 'Trace'`；
+  用 `Shape` 的 IDispatch 名字表查 `Trace` 也报"未知名称"——确认它不在 Shape 上，
+  必须先取 `Shape.Bitmap`（memid 1610743827，返回 `IVGBitmap`）。
+- `Smoothing` / `DetailLevelPercent` 是 **0–255** 刻度（社区代码写 `10 * 2.55`）。
+
+### 9.3 参数确实生效，六个轮廓预设也确有区别
+
+同一张图（art01_1x，662×326，114.232×56.253 mm），`Finish()` 之后**递归数群组内**：
+
+| 预设 | 曲线数 | 节点数 |
+| --- | --- | --- |
+| 轮廓-线条图 LineArt | 165 | 2711 |
+| 轮廓-徽标 Logo | 21 | 728 |
+| 轮廓-详细徽标 DetailedLogo | 30 | 839 |
+| 轮廓-剪贴画 Clipart | 186 | 2181 |
+| 轮廓-低质量 LowQuality | 30 | 839 |
+| 轮廓-高质量 HighQuality | 186 | 2181 |
+| 中心线-技术图解 Technical | 40 | 749（**无填充**） |
+| 中心线-线条图 LineDrawing | 40 | 749（**无填充**） |
+
+`Smoothing = DetailLevel` 扫一遍（LineArt）：
+
+| 取值 | 0 | 32 | 64 | 96 | 128 | 160 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 节点数 | 13780 | 709 | 1593 | 2645 | 2711 | 2711 |
+
+可见参数是生效的，只是**非单调**，而且 128 以上就进入平台期。
+（顺带：把 Smoothing/Detail 一起推到 192 时，X8 进程又崩了——见 9.5。）
+
+### 9.4 质量对比：这才是决定性的
+
+比法要公平，所以做了两件事：
+1. 喂给 PowerTRACE 的位图分辨率与喂给 potrace 的对齐（1× 与 2× 各测一次）；
+2. **不用 `doc.Export`**（见 9.5），而是**直接从 COM 读描摹结果的曲线几何**
+   （`Curve.SubPaths` → `Segments` → 展平三次贝塞尔），自己按源图网格光栅化，
+   再算 IoU / 召回 / 精确 / 面积比。这样拿到的是精确几何，不经过渲染。
+
+| 方案 | IoU% | 召回% | 精确% | 面积比 |
+| --- | --- | --- | --- | --- |
+| **我们 potrace（U=8 + 阈值寻优）** | **99.67** | 99.74 | 99.93 | 0.998 |
+| PowerTRACE 轮廓-线条图（1×） | 68.05 | 91.17 | 72.85 | 1.251 |
+| PowerTRACE 轮廓-剪贴画（1×） | 67.49 | 89.90 | 73.03 | 1.231 |
+| PowerTRACE 轮廓-详细徽标（1×） | 65.01 | 75.52 | 82.37 | 0.917 |
+| PowerTRACE 轮廓-徽标（1×） | 62.22 | 72.44 | 81.51 | 0.889 |
+| PowerTRACE 中心线（1×） | 29.26 | 33.12 | 71.51 | 0.463 |
+| PowerTRACE 轮廓-线条图（2×） | 72.38 | 91.96 | 77.27 | 1.190 |
+| PowerTRACE 轮廓-剪贴画（2×） | 71.77 | 90.80 | 77.40 | 1.173 |
+| PowerTRACE 中心线（2×） | 36.13 | 42.71 | 70.10 | 0.609 |
+
+三点结论：
+
+- **上采样对 PowerTRACE 也有用**（线条图 68.05% → 72.38%），但**远不足以追平**
+  我们 99.67%。差距不是参数问题，是它的算法本身在小图上就丢细节。
+- **中心线低到 29–36%**，面积比只有 0.46–0.61：因为它输出的是**开放路径 + 描边**，
+  不是实心轮廓。用"填充面积"去衡量它本身就不公平，但这也正说明**它不能替代
+  轮廓描摹**——目标是复刻外观，不是抽骨架。
+- 面积比普遍偏离 1（1.19–1.25 偏粗、0.89 偏细），说明它没有"笔画粗细"这个可调量，
+  而我们的阈值寻优正是拿 IoU + 面积比双指标去卡这个的。
+
+### 9.5 仍然成立的三个硬问题
+
+1. **`doc.Export` 在"被 COM 拉起"的 X8 实例上必然失败**，报
+   `(-2147352567, '发生意外。')`。做了对照：新建文档 + 只画一个矩形 + 导出，
+   **同样失败**，所以与描摹无关，是实例状态问题（用户手动启动的那个实例可以导出）。
+   因此做质量对比时改走"读几何自己光栅化"，不依赖导出。
+2. **大位图会让 X8 崩溃**。5296×2608 直接让进程消失；另外把
+   `Smoothing/DetailLevel` 推到 192 时进程也崩了（RPC 服务器不可用）。
+   而本 skill 的主力工作图就在这个量级。
+3. **中心线没有填充**：`Fill.Type == 0`（无填充），是开放路径 + 描边。
+   要复刻外观得再把骨架宽度换算成 stroke 宽度，属于另一套模型。
+
+### 9.6 结论
+
+| 维度 | 内置 PowerTRACE | 自研 potrace 流水线 |
+| --- | --- | --- |
+| X8 可用性 | ⚠️ 能跑，但实例状态敏感、大图崩 | ✅ 端到端实测 3 分 56 秒跑通 |
+| 参数可控 | ⚠️ 生效但非单调、高档位崩 | ✅ 阈值可扫、可寻优 |
+| 还原质量 | ❌ 68–72%（轮廓） | ✅ **99.67%** |
+| 可评估 | ❌ 黑盒，无中间量 | ✅ 每区有 IoU / 召回 / 精确 / 面积比 |
+| 可回归测试 | ❌ 无法离线断言 | ✅ 66 项离线断言 |
+| 大图稳定 | ❌ 5296×2608 崩进程 | ✅ 主力工作图就是这个量级 |
+
+**所以内置描摹不用于主路径**——不是因为它"跑不起来"（它能跑，第一轮说它跑不起来
+是我数错了），而是因为**质量差了一个量级、且不可控不可测**。
+
+唯一值得吸收的是**中心线思想**：细笔画文字（6pt 页脚）用轮廓描摹要
+73 子路径 / 840 段，中心线只要 6 曲线 / 6 节点，差两个数量级。该思路可自研
+（Zhang-Suen 细化 → 骨架 → 折线提取 → Douglas-Peucker，纯 numpy + cv2，无新依赖），
+但简化参数需调优、视觉保真需验证，**目前未并入主流程**。
+
+> 另外一条路比"中心线瘦身"更彻底：**把文字识别出来、用最接近的字体重建成活字**。
+> 见 `references/live-text-design.md`——实测页脚能做到 IoU 0.7244、节点数从 840 段
+> 降到 1 个文本对象，而且**文字可编辑**。

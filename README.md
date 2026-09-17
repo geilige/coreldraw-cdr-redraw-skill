@@ -147,6 +147,61 @@ CorelDRAW）：用一张几何已知的合成图覆盖残留剥离、外沿外�
 剩下几个点差在哪：源图最左侧 4px 贯穿全高的裁切残留**有意未复刻**，
 差异图 `overlay_diff.png` 里那条红线就是它；其余为描摹固有的 1px 边缘偏差。
 
+## 为什么不用 CorelDRAW 内置的"轮廓描摹/中心线描摹"
+
+X8 内置 PowerTRACE 的宏接口**能跑**，但质量差一个量级，所以不用于主路径。
+同一区域（art01，662×326，对齐分辨率后各算 IoU）：
+
+| 方案 | IoU% | 面积比 |
+| --- | --- | --- |
+| **本技能 potrace（U=8 + 阈值寻优）** | **99.67** | 0.998 |
+| PowerTRACE 轮廓-线条图（1× / 2×） | 68.05 / 72.38 | 1.251 / 1.190 |
+| PowerTRACE 轮廓-剪贴画（1× / 2×） | 67.49 / 71.77 | 1.231 / 1.173 |
+| PowerTRACE 中心线（1× / 2×） | 29.26 / 36.13 | 0.463 / 0.609 |
+
+上采样对它也有用，但远不足以追平。面积比普遍偏离 1，说明它**没有"笔画粗细"
+这个可调量**——而阈值寻优正是拿 IoU + 面积比双指标去卡这个的。中心线输出的是
+**开放路径 + 描边、无填充**，与"复刻外观"的目标不同，不能替代轮廓描摹。
+
+另外两个硬问题：大位图会让 X8 崩（5296×2608 直接进程消失）；`doc.Export` 在
+"被 COM 拉起"的实例上必然失败（连纯矩形都失败，是实例状态问题）。
+
+> 顺带记一次自我纠错：第一轮实测曾得出"`Finish()` 不产出矢量""参数被忽略"，
+> **两条都是错的**。`Finish()` 的产物是 `cdrGroupShape = 7`（群组），而我的计数
+> 只看了 `Type == 3`（曲线），把它整个漏掉了；"参数不生效"是因为挑了 128 与 255
+> 两个恰好同档的值去比。**判某功能无效之前，先确认自己的探针能看见它。**
+
+完整实测数据（接口签名、枚举真值、参数扫描、逐预设对照）见
+`skills/coreldraw-x8-redraw/references/raster-to-vector-notes.md` §9。
+
+## 文字能不能转成可编辑的活字
+
+能，而且比"中心线瘦身"更彻底。实测 vonder 页脚那行 6pt 文字：
+
+- 识别出 `O.v.D. Importadora e Distribuidora Ltda. • Curitiba - PR`
+- 字体匹配到 **Swis721 Cn BT / Bold**，IoU **0.7244**，领先候选集中位 **2.67 倍**
+- 重建为 **1 个文本对象**，文字可编辑；而描摹轮廓是 73 子路径 / 840 段
+
+```powershell
+python skills\coreldraw-x8-redraw\scripts\cdr_text_live.py ^
+  --image ref.png --region footer=0,17,0,372 ^
+  --mm-per-px 0.17256 --out-dir out\text
+```
+
+**但默认不自动替换描摹轮廓**——字体猜错比描摹失真更糟。必须看产出的 `verdict`：
+`keep_trace` 就保留轮廓，并在报告里列出库里最接近的候选让用户决定。
+
+三个关键设计点：
+
+1. **OCR 要跑多套预处理投票**。实测同一张图，`2× + 20px 四周留白`出乱码、
+   `2× + 纵向 0 留白`出正确答案——没有一套参数对所有图都稳。
+2. **判定不能用绝对 IoU 门槛**。16px 小字即使文本与字体都对，IoU 也只有 0.61；
+   用 0.62 的绝对门槛会把完美匹配也拒掉。改用 `lift = 最佳 ÷ 候选中位`（与字号无关）。
+3. **易混符号直接量字形**（`•` 宽高比 1.25 / 墨密度 0.80，`-` 宽高比 4.00），
+   大小写改动才走整体 IoU 逐词裁决——单个窄字形只占整行约 1% 面积，全局 IoU 分不出来。
+
+详见 `skills/coreldraw-x8-redraw/references/live-text-design.md`。
+
 ## 安装
 
 把 `skills/coreldraw-x8-redraw` 目录放到你的技能目录下：
@@ -196,7 +251,7 @@ python -m pip install pywin32
 
 ## 脚本
 
-技能内含七个脚本，主入口会调用其余几个。
+技能内含八个脚本，主入口会调用其余几个。
 
 **主入口（位图 → CDR）：**
 
@@ -221,6 +276,18 @@ python skills\coreldraw-x8-redraw\scripts\cdr_visual_diff.py ^
   --source ref.png --render out\cover_preview.png ^
   --placement out\placement.json --out compare
 ```
+
+**文字转活字（可选，独立一步）：**
+
+```powershell
+python skills\coreldraw-x8-redraw\scripts\cdr_text_live.py ^
+  --image ref.png --region footer=0,17,0,372 ^
+  --mm-per-px 0.17256 --out-dir out\text
+```
+
+识别文字 → 匹配系统字体 → 判定能否转成真文本。产出 `live_text.json`、
+`font_match_<区>.json` 与三联对照图。**`verdict` 为 `keep_trace` 时不要转**，
+保留描摹轮廓。
 
 **CDR 剖析与重建：**
 
@@ -252,12 +319,15 @@ skills/coreldraw-x8-redraw/
 │   ├── cdr_image_trace.py            标定 + 分区 + 描摹 + 参数寻优
 │   ├── cdr_image_place.py            按清单在 CorelDRAW 中重建
 │   ├── cdr_visual_diff.py            配准式像素校验
+│   ├── cdr_text_live.py              文字识别 + 字体匹配 → 转可编辑活字
 │   ├── cdr_prompt_builder.py         生成文件专属重绘提示词
 │   ├── cdr_redraw.py                 形状级精确重建与结构校验
 │   ├── cdr_common.py                 COM 连接、重试、遍历、统计
 │   └── selftest_offline.py           离线回归测试（66 项断言，含自动分区合成图）
 └── references/
     ├── raster-to-vector-notes.md     ★ 位图矢量化必读（实测踩坑结论）
+    │                                 §9 = 内置 PowerTRACE 完整实测
+    ├── live-text-design.md           ★ 文字转活字的设计、判据与产出
     ├── coreldraw-object-model.md     X8 COM 对象模型与枚举
     └── prompt-template.md            定制提示词模板
 ```

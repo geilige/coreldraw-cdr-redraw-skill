@@ -163,6 +163,78 @@ python scripts\cdr_bitmap_to_cdr.py --report-only --out-dir out\ref_work ^
 接触裁剪边界的白色连通域）见 `references/raster-to-vector-notes.md`，那份文档
 是实测踩坑结论，照做可以省掉大量试错。
 
+### 为什么不用 CorelDRAW 内置描摹（PowerTRACE）
+
+**结论：内置描摹能跑，但质量差一个量级，且不可控不可测，所以不用于主路径。**
+
+先澄清一个我自己写错过的结论——第一轮实测曾得出"`Finish()` 不产出矢量""参数被忽略"，
+**两条都是错的**：`Finish()` 的产物是 `cdrGroupShape = 7`（群组），我的计数只看了
+`Type == 3`（曲线）把它整个漏掉了；而"参数不生效"是因为我挑了 128 与 255 两个
+**恰好同档**的值去比（刻度是 0–255，128 以上进平台期）。**判某功能无效之前，
+先确认自己的探针能看见它。**
+
+接口与实测事实：
+
+- 入口是 `Shape.Bitmap.Trace(...)`（`Trace` 挂在 `IVGBitmap` 上，**不在** `IVGShape` 上），
+  返回的 `TraceSettings` 只算预览（`CurveCount` / `NodeCount`）；`Finish()` 才提交，
+  提交后原位图被替换成**一个群组**（要递归展开才数得到曲线）。
+- 六个轮廓预设确有区别（art01_1x：线条图 165 曲线/2711 节点、徽标 21/728、
+  详细徽标 30/839、剪贴画 186/2181）。
+- 中心线（`cdrTraceTechnical = 7` / `cdrTraceLineDrawing = 8`）输出**开放路径 + 描边、
+  无填充**，与"复刻外观"的目标不同，不能替代轮廓描摹。
+
+**质量对比（同一区域，公平对齐分辨率后各算 IoU）：**
+
+| 方案 | IoU% | 面积比 |
+| --- | --- | --- |
+| **我们 potrace（U=8 + 阈值寻优）** | **99.67** | 0.998 |
+| PowerTRACE 轮廓-线条图（1× / 2×） | 68.05 / 72.38 | 1.251 / 1.190 |
+| PowerTRACE 轮廓-剪贴画（1× / 2×） | 67.49 / 71.77 | 1.231 / 1.173 |
+| PowerTRACE 中心线（1× / 2×） | 29.26 / 36.13 | 0.463 / 0.609 |
+
+上采样对它也有用，但远不足以追平；面积比普遍偏离 1，说明它没有"笔画粗细"这个可调量，
+而我们的阈值寻优正是拿 IoU + 面积比双指标去卡这个的。
+
+另外两个硬问题：**大位图会让 X8 崩**（5296×2608 直接进程消失；
+`Smoothing/DetailLevel` 推到 192 也崩）；**`doc.Export` 在"被 COM 拉起"的实例上
+必然失败**（连纯矩形都失败，是实例状态问题，不是描摹的问题）。
+
+唯一值得吸收的是**中心线思想**：细笔画文字用轮廓描摹要 73 子路径 / 840 段，
+中心线只要 6 曲线 / 6 节点，差两个数量级。该思路可自研
+（Zhang-Suen 细化 → 骨架 → 折线提取 → Douglas-Peucker，纯 numpy + cv2 无新依赖），
+但简化参数需调优、视觉保真需验证，**目前未并入主流程**。
+
+完整实测数据（接口签名、枚举真值、参数扫描、逐预设对照、自我纠错记录）见
+`references/raster-to-vector-notes.md` §9。
+
+### 细笔画文字：更彻底的一条路是转活字
+
+比"中心线瘦身"更彻底：**把文字识别出来、用最接近的字体重建成真文本**。
+实测 vonder 页脚那行 6pt 文字：识别 → 字体匹配到 **Swis721 Cn BT / Bold**（IoU 0.7244，
+领先候选集中位 **2.67 倍**）→ 重建为 1 个文本对象，**文字可编辑**，
+而描摹轮廓是 73 子路径 / 840 段。
+
+```bash
+python scripts\cdr_text_live.py --image 源图.png ^
+    --region footer=0,17,0,372 --mm-per-px 0.17256 --out-dir out\text
+```
+
+产出 `live_text.json`（含逐区文本、选定字体、IoU、lift、判定）、
+`font_match_<区>.json`、`compare_<区>.png` 三联对照图。
+
+**但默认不自动替换描摹轮廓**——字体猜错比描摹失真更糟。必须看 `verdict`：
+`keep_trace` 就保留轮廓，并在报告里列出库里最接近的候选让用户决定。
+
+三个关键设计点（详见 `references/live-text-design.md`）：
+
+1. **OCR 要跑多套预处理投票**。实测同一张图，2×+20px 留白出乱码、
+   2×+纵向 0 留白出正确答案——**没有一套参数对所有图都稳**。
+2. **判定不能用绝对 IoU 门槛**。16px 小字即使文本与字体都对，IoU 也只有 0.61；
+   用 0.62 的绝对门槛会把完美匹配也拒掉。改用 `lift = 最佳 ÷ 候选中位`（与字号无关）。
+3. **易混符号直接量字形**（`•` 宽高比 1.25/密度 0.80 vs `-` 宽高比 4.00），
+   大小写改动才走整体 IoU 逐词裁决——因为单个窄字形只占整行约 1% 面积，
+   全局 IoU 分不出来。
+
 ## 判断还原度：不要靠眼睛
 
 **对照图必须同尺度。** 源图原生密度（如 5.795 px/mm）与 CorelDRAW 导出密度
@@ -383,6 +455,21 @@ python scripts\cdr_visual_diff.py --source ref.png ^
 
 产出整页 IoU / 召回 / 精确、分区域指标、差异叠加图与放大对照图。
 
+### 文字转活字（可选，独立一步）
+
+`scripts/cdr_text_live.py` —— 识别文字 + 匹配字体 + 判定能否转成真文本：
+
+```text
+python scripts\cdr_text_live.py --image ref.png ^
+  --region footer=0,17,0,372 --mm-per-px 0.17256 --out-dir out\text
+python scripts\cdr_text_live.py --image ref.png --region "t:0,20,0,400" ^
+  --mm-per-px 0.17256 --out-dir out\text --corel-only
+```
+
+产出 `live_text.json`（逐区文本 / 选定字体 / IoU / lift / 判定）、
+`font_match_<区>.json`、`compare_<区>.png` 三联对照图。
+**`verdict` 为 `keep_trace` 时不要转**，保留描摹轮廓并在报告里说明。
+
 ### CDR 剖析与重建
 
 ```text
@@ -400,6 +487,19 @@ python -m pip install pywin32          # 只有要建 CDR 时才需要
 python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线回归测试（66 项断言）
 ```
 
+文字转活字另需 OCR（离线，无需联网）：
+
+```text
+python -m pip install --no-deps rapidocr-onnxruntime
+python -m pip install onnxruntime pyclipper shapely six flatbuffers protobuf pyyaml
+```
+
+注意两点：`rapidocr` 声明的依赖是 `opencv-python`（非 headless），直接装会试图替换
+已有的 `cv2` 并被安全删除拦截，所以要用 `--no-deps` 分两步装；
+Windows 上 `onnxruntime` 还缺 `vcruntime140_1.dll` 与 `msvcp140_1.dll`
+（前者 Python 安装目录自带），缺了会报 `DLL load failed`。
+用 `pefile` 查 `.pyd` 的导入表能直接看出缺哪个。详见 `references/live-text-design.md`。
+
 `selftest_offline.py` 覆盖两块：纯逻辑（提示词渲染、CDR 结构比对），以及
 **用一张几何已知的合成图**验证自动分区的每一处坑——残留剥离、外沿外扩、
 满版色带贯通判据、行中位数、列方向切分、超采样度量的偏差量级。
@@ -412,6 +512,10 @@ python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线回归测�
 - `references/raster-to-vector-notes.md`：**位图矢量化必读**。potracer 的 invert 约定、
   evenodd、`Z M` 分隔符、上采样对细部保真的影响、`alphamax=0` 的多边形陷阱、
   阈值决定笔画粗细、用面积比判粗细、对照图必须同尺度、X8 的 `ExportEx` 缺陷、
-  配准校验方法与交付自查清单。
+  配准校验方法与交付自查清单；§9 是 CorelDRAW 内置 PowerTRACE 的完整实测
+  （含一次判断错误的自我纠错记录）。
+- `references/live-text-design.md`：**文字转活字必读**。OCR 多套预处理投票、
+  列投影切词、字形级纠错、字体匹配打分、为什么不能用绝对 IoU 判定、
+  CDR 侧字号与宽度分开解、依赖安装的两个坑、适用边界与已知限制。
 - `references/coreldraw-object-model.md`：CorelDRAW X8 COM 对象模型、枚举与跨文档复制要点。
 - `references/prompt-template.md`：定制提示词的完整模板与骨架。
