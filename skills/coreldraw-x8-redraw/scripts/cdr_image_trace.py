@@ -97,7 +97,11 @@ def probe_edges(src):
 
 
 def region_mask(src, y0, y1, x0, x1, invert=False, upscale=1, threshold=128):
-    """取区域灰度（可上采样）并二值化。返回 True = 要描摹的墨迹。"""
+    """取区域灰度（可上采样）并二值化。返回 True = 要描摹的墨迹。
+
+    threshold 越低，算作墨迹的像素越少 → 笔画越细；越高越粗。
+    细笔画文字（6pt 级）对阈值很敏感，值得用 --probe 扫一遍。
+    """
     sub = src.gray[y0:y1, x0:x1]
     if upscale > 1:
         sub = np.array(Image.fromarray(sub).resize(
@@ -249,9 +253,10 @@ def svg_viewbox(svg_text):
     return [float(v) for v in m.group(1).split()]
 
 
-def evaluate(src, y0, y1, x0, x1, invert, upscale, turdsize, alphamax, opttolerance):
+def evaluate(src, y0, y1, x0, x1, invert, upscale, turdsize, alphamax,
+             opttolerance, threshold=128):
     """描摹后光栅化回**源像素网格**，与该区域二值掩膜比对，得到保真指标。"""
-    fg = region_mask(src, y0, y1, x0, x1, invert, upscale)
+    fg = region_mask(src, y0, y1, x0, x1, invert, upscale, threshold)
     svg, subs, _ = mask_to_svg(fg, src.mm_per_px / upscale, x0 * upscale,
                                y0 * upscale, turdsize, alphamax, opttolerance)
     ref = region_mask(src, y0, y1, x0, x1, invert, 1)
@@ -263,6 +268,7 @@ def evaluate(src, y0, y1, x0, x1, invert, upscale, turdsize, alphamax, opttolera
         "iou": round(inter / union * 100, 2) if union else 100.0,
         "recall": round(inter / ref.sum() * 100, 2) if ref.sum() else 100.0,
         "precision": round(inter / acc.sum() * 100, 2) if acc.sum() else 100.0,
+        "ink_ratio": round(acc.sum() / ref.sum(), 3) if ref.sum() else 1.0,
         "subpaths": len(subs),
         "svg": svg,
     }
@@ -331,15 +337,20 @@ def main(argv=None):
     ap.add_argument("--auto", action="store_true",
                     help="自动按投影分割区域（--region 同时给出时以 --region 为准）")
     ap.add_argument("--out", default="svg", help="输出目录")
-    ap.add_argument("--upscale", type=int, default=4,
-                    help="描摹前灰度上采样倍数（默认 4，细部保真关键）")
-    ap.add_argument("--turdsize", type=int, default=3,
+    ap.add_argument("--upscale", type=int, default=8,
+                    help="描摹前灰度上采样倍数（默认 8）。细部保真的关键："
+                         "实测 U=4 得 95.2%% / U=8 得 98.3%%。"
+                         "超大区域可用 4 控制耗时")
+    ap.add_argument("--turdsize", type=int, default=2,
                     help="斑点面积阈值（源图像素；内部按 upscale² 折算）")
-    ap.add_argument("--alphamax", type=float, default=0.5,
+    ap.add_argument("--alphamax", type=float, default=1.0,
                     help="拐角阈值 0..1.33。0 = 纯多边形（禁用平滑），"
-                         "1.0 = 最大平滑。推荐 0.5~1.0，不要用 0")
+                         "1.0 = 最大平滑。U≥8 时用 1.0 最安全；不要用 0")
     ap.add_argument("--opttolerance", type=float, default=0.1,
                     help="曲线优化容差；越大越简并")
+    ap.add_argument("--threshold", type=int, default=128,
+                    help="二值化阈值，默认 128。阈值越低笔画越细；"
+                         "细笔画文字（6pt 级）建议用 --probe 扫 110~150")
     ap.add_argument("--probe", action="store_true",
                     help="参数扫描：对每个区域列出候选参数的 IoU，不写 SVG")
     ap.add_argument("--crop-left", type=int, default=0,
@@ -380,43 +391,48 @@ def main(argv=None):
     os.makedirs(args.out, exist_ok=True)
 
     if args.probe:
-        print("参数扫描（U=上采样倍数，ts=turdsize 折算后，am=alphamax，ot=opttolerance）")
+        print("参数扫描（U=上采样，ts=turdsize 折算后，thr=二值化阈值，"
+              "am=alphamax，ot=opttolerance）")
         print("注意：alphamax=0 会让 potrace 输出纯多边形（圆角变折线）。"
               "它的 IoU 可能最高但视觉最差，务必同时看「曲线段」列。")
-        print(f"{'region':12s} {'U':>2s} {'ts':>5s} {'am':>5s} {'ot':>5s} "
-              f"{'IoU%':>7s} {'召回%':>7s} {'精确%':>7s} {'子路径':>6s} {'曲线段':>6s}")
+        print(f"{'region':12s} {'U':>2s} {'ts':>5s} {'thr':>4s} {'am':>5s} "
+              f"{'ot':>5s} {'IoU%':>7s} {'召回%':>7s} {'精确%':>7s} "
+              f"{'子路径':>6s} {'曲线段':>6s} {'面积比':>8s}")
         best = {}
         for name, r in regions:
             rows = []
-            for U in (1, 2, 4):
+            for U in (4, 8):
                 for ts0 in (2, 3):
-                    for am in (0.0, 0.5, 0.8, 1.0):
-                        for ot in (0.1, 0.2):
-                            ts = max(1, int(round(ts0 * U * U)))
-                            m = evaluate(src, r["y0"], r["y1"], r["x0"], r["x1"],
-                                         r["invert"], U, ts, am, ot)
-                            rows.append((m["iou"], U, ts, am, ot, m))
+                    for thr in (112, 118, 128, 138, 148):
+                        for am in (0.8, 1.0):
+                            for ot in (0.1,):
+                                ts = max(1, int(round(ts0 * U * U)))
+                                m = evaluate(src, r["y0"], r["y1"], r["x0"],
+                                             r["x1"], r["invert"], U, ts, am, ot,
+                                             threshold=thr)
+                                rows.append((m["iou"], U, ts, thr, am, ot, m))
             rows.sort(key=lambda t: -t[0])
-            for iou, U, ts, am, ot, m in rows[:6]:
-                print(f"{name:12s} {U:2d} {ts:5d} {am:5.1f} {ot:5.2f} "
+            for iou, U, ts, thr, am, ot, m in rows[:8]:
+                print(f"{name:12s} {U:2d} {ts:5d} {thr:4d} {am:4.1f} {ot:5.2f} "
                       f"{m['iou']:7.2f} {m['recall']:7.2f} "
                       f"{m['precision']:7.2f} {m['subpaths']:6d} "
-                      f"{m['svg'].count('C'):6d}")
+                      f"{m['svg'].count('C'):6d} {m['ink_ratio']:8.3f}")
             # 只在能产生真实曲线的候选中选最优（排除 alphamax=0 的多边形退化）
-            curved = [t for t in rows if t[5]["svg"].count("C") > 0]
+            curved = [t for t in rows if t[6]["svg"].count("C") > 0]
             best[name] = curved[0] if curved else rows[0]
             print()
         print("=== 各区域最优（已排除 alphamax=0 的多边形退化）===")
-        for name, (iou, U, ts, am, ot, m) in best.items():
-            print(f"  {name:12s} IoU {iou:6.2f}%   "
+        for name, (iou, U, ts, thr, am, ot, m) in best.items():
+            print(f"  {name:12s} IoU {iou:6.2f}%  面积比 {m['ink_ratio']:.3f}   "
                   f"--upscale {U} --turdsize {max(1, ts // (U * U))} "
-                  f"--alphamax {am} --opttolerance {ot}")
+                  f"--threshold {thr} --alphamax {am} --opttolerance {ot}")
         with open(os.path.join(args.out, "best_params.json"), "w",
                   encoding="utf-8") as f:
             json.dump({k: {"upscale": v[1], "turdsize_source_px": max(1, v[2] // (v[1] ** 2)),
-                           "turdsize_internal": v[2],
-                           "alphamax": v[3], "opttolerance": v[4],
-                           "iou": v[0], "curve_segments": v[5]["svg"].count("C")}
+                           "turdsize_internal": v[2], "threshold": v[3],
+                           "alphamax": v[4], "opttolerance": v[5],
+                           "iou": v[0], "ink_ratio": v[6]["ink_ratio"],
+                           "curve_segments": v[6]["svg"].count("C")}
                        for k, v in best.items()},
                       f, ensure_ascii=False, indent=2)
         return 0
@@ -438,7 +454,8 @@ def main(argv=None):
         x0, y0, x1, y1 = r["x0"], r["y0"], r["x1"], r["y1"]
         if args.crop_left:
             x0 = max(x0, args.crop_left)
-        fg = region_mask(src, y0, y1, x0, x1, r["invert"], args.upscale)
+        fg = region_mask(src, y0, y1, x0, x1, r["invert"], args.upscale,
+                         args.threshold)
         if not fg.any():
             print(f"{name:12s} 掩膜为空，跳过")
             continue
