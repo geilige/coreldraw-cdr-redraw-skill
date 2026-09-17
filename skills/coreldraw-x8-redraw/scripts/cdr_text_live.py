@@ -17,13 +17,14 @@
   4. 字形级纠错：按字符高度定大小写、按墨量定 ·/• 之类易混符号
   5. 字体匹配：把系统字体逐个渲染同串文本，按高度归一后比 IoU
   6. 解字号（决定高度）与横向缩放（决定宽度），两者分开解
-  7. 判定，**四条判据缺一不可**（`decide_convert`）：
+  7. 判定，**四条判据缺一不可**（`decide_convert`），见下：
        硬门槛 A：连通分量数 ÷ 字符数 —— 这块到底是不是一行文字
        硬门槛 B：最佳候选的自然宽度比 —— 有没有字体的字宽与它相符
        相似度 C：重建 IoU 绝对值（适合大字号）
        相似度 D：领先候选集中位的倍数（与字号无关，适合小字）
      C 或 D 过即可，但 A 与 B 必须都过；否则保留描摹轮廓，不转
-  8. --apply 时才真的在 CorelDRAW 里建文本
+  8. --apply 时才真的在 CorelDRAW 里建文本；再给 --replace-traced
+     就把该区域的描摹轮廓删掉（**必须删**，否则与活字叠加等于把字加粗一遍）
 
 产出
 ----
@@ -139,28 +140,101 @@ def _otsu_1d(vals):
 # OCR
 # --------------------------------------------------------------------------
 
-# OCR 的预处理变体。**为什么不是一套参数**：实测同一张页脚图，
-#   scale=2 + 20px 四周留白  -> 乱码 'mporaraeDisibdra Ldaurti'
-#   scale=2 + 纵向不留白      -> 正确 'O.v.D. Importadora e Distribuidora Ltda. ...'
-#   scale=4 + 20px 四周留白  -> 正确，置信度 0.931
-# 检测器对纵向留白与长宽比极敏感，且不同图的最优点不同，所以固定一套参数
-# 不可靠。改成跑多套变体再投票：取置信度最高者，但要求它的字符长度与
-# 至少一个其它变体一致，否则视为不可信。
+# OCR 的预处理变体 (标签, 缩放, 横向留白, 纵向留白, 二值化阈值)。
+#
+# **为什么不是一套参数**：检测器对纵向留白与长宽比极敏感，且不同图的最优点
+# 不同——实测同一张页脚图，`scale=2 + 20px 四周留白`出乱码、
+# `scale=2 + 纵向 0 留白`出正确答案。所以固定一套参数不可靠，要跑多套再选。
+#
+# **二值化必须是独立的一维，而且是决定性的那一维**。实测同一区域、同一裁切框
+# （源图直裁 371x16，灰度 min 8 / max 255，是个低分辨率扫描件）：
+
+#     模式          变体数   完全正确
+#     原始灰度        4        0
+#     二值化         12        7
+#
+# 原始灰度**全错**，且错法一致：`O.V.D.`（大小写错）＋词间空格被吃掉
+# （9 个词读成 7 个）。原因是 6pt 的字在这个分辨率下笔画边缘全是抗锯齿，
+# 检测器分不清字与字之间的浅灰缝隙；二值化把笔画还原成锐利边缘后就分得清。
+# 阈值取 **118/128/Otsu** 都能出正确答案，所以三档都放进变体里。
+#
+# **⚠️ 置信度不能用来选**：上面那张表里，错误的灰度变体置信度最高到 0.921，
+# 而正确的二值变体只有 0.849~0.918。按置信度选会**系统性地选错**。
+# 所以 `ocr_lines` 改成用**列投影切出的词数**当第一判据——那是独立于 OCR 的
+# 几何证据（实测：词数 == 9 的变体全部正确，≠9 的全部错误，这条判据
+# 在该表上 100% 分对）。
 OCR_VARIANTS = [
-    ('1x_宽留白', 1, 400, 0),
-    ('2x_无纵留白', 2, 20, 0),
-    ('2x_微纵留白', 2, 20, 8),
-    ('3x_20留白', 3, 20, 20),
-    ('4x_20留白', 4, 20, 20),
+    ('1x_宽留白', 1, 400, 0, None),
+    ('2x_无纵留白', 2, 20, 0, None),
+    ('2x_微纵留白', 2, 20, 8, None),
+    ('3x_20留白', 3, 20, 20, None),
+    ('4x_20留白', 4, 20, 20, None),
+    ('2x_二值118', 2, 20, 8, 118),
+    ('4x_二值118', 4, 20, 20, 118),
+    ('2x_二值128', 2, 20, 8, 128),
+    ('4x_二值128', 4, 20, 20, 128),
+    ('4x_二值Otsu', 4, 20, 20, 'otsu'),
+    ('1x_二值118_宽留白', 1, 400, 0, 118),
 ]
 
 
-def _ocr_once(engine, base, scale, pad_x, pad_y):
-    im = base
+def _otsu_gray(arr):
+    """灰度图的 1D Otsu 阈值（按直方图，256 档全扫）。
+
+    **⚠️ 平台期必须取中点，不能取第一个最大值**。类间方差在"两个峰之间"
+    是一段**完全相等的平台**：一个只有 40 与 220 两个灰度的图，t 取 40..219
+    算出的方差一模一样。若用严格大于保留第一个，就会返回 40——阈值落在
+    暗峰的**边缘**上，`a < 40` 一个像素都不剩，二值图全白，OCR 直接失效。
+    实测踩过：合成双峰图返回 40、二值后墨迹占比 0.00。
+    这与"参数有平台期时不能只比两个点"是同一类错误。
+    """
+    hist = np.bincount(arr.ravel(), minlength=256).astype(float)
+    total = hist.sum()
+    if total <= 0:
+        return 128
+    s_total = float((hist * np.arange(256, dtype=float)).sum())
+    best_v, lo, hi = -1.0, 128, 128
+    w0 = 0.0
+    s0 = 0.0
+    for t in range(256):
+        w0 += hist[t]
+        s0 += hist[t] * t
+        w1 = total - w0
+        if w0 <= 0 or w1 <= 0:
+            continue
+        v = w0 * w1 * (s0 / w0 - (s_total - s0) / w1) ** 2
+        if v > best_v * (1 + 1e-12) + 1e-12:
+            best_v, lo, hi = v, t, t
+        elif v >= best_v * (1 - 1e-12) - 1e-12:
+            hi = t
+    return (lo + hi) // 2
+
+
+def binarize(im, thr):
+    """按阈值二值化（黑字白底）。thr 为 'otsu' 时按图自算。
+
+    返回灰度 PIL（0/255）而不是 mode '1'：后面 `_ocr_once` 要转 RGB，
+    保持灰度能让所有变体走同一条路径。
+
+    **极性保护**：本函数假定"深色字 + 浅色底"。若二值后墨迹占比超过一半，
+    说明这块是**反白字**（深底浅字），直接反相——否则整块会变成一团黑，
+    OCR 只会吐垃圾。反白字本来就不适合转活字（见文档），但也不该崩出乱码。
+    """
+    a = np.asarray(im.convert('L'))
+    t = _otsu_gray(a) if thr == 'otsu' else int(thr)
+    b = a < t
+    if b.mean() > 0.5:
+        b = ~b
+    return Image.fromarray(np.where(b, 0, 255).astype(np.uint8))
+
+
+def _ocr_once(engine, base, scale, pad_x, pad_y, binz=None):
+    """跑一套预处理。`binz` 是二值化阈值（None=不二值化，'otsu'=自算）。"""
+    im = binarize(base, binz) if binz is not None else base
     if scale != 1:
         im = im.resize((im.width * scale, im.height * scale), Image.LANCZOS)
     bg = Image.new('RGB', (im.width + pad_x * 2, im.height + pad_y * 2), 'white')
-    bg.paste(im, (pad_x, pad_y))
+    bg.paste(im.convert('RGB'), (pad_x, pad_y))
     res, _ = engine(np.asarray(bg))
     out = []
     for item in (res or []):
@@ -168,10 +242,38 @@ def _ocr_once(engine, base, scale, pad_x, pad_y):
     return out
 
 
-def ocr_lines(mask_img, variants=None):
-    """多套预处理跑 OCR 再投票。返回 (lines, variants_report, err)。
+def pick_variant(ok):
+    """从成功识别出文本的变体里挑一个。就地写回 `agreement` 字段。
 
-    lines 形如 [(text, score, box), ...]，已按纵向位置排序拼接为整行文本。
+    **选择顺序**（这是关键，别改回"按置信度选"）：
+      1. `word_gap` 升序 —— `|OCR 词数 − 列投影词数|`。列投影是**独立于
+         OCR 的几何证据**；实测它在该区 100% 分对（9 词的全对、≠9 词的全错），
+         而置信度会把错误的变体排在正确的前面（错误 0.921 > 正确 0.918）。
+      2. 置信度降序 —— 仅在 word_gap 相同时打破平局。
+      3. 字符数与其它变体的一致性 —— 沿用"至少一个变体同字符数"的校验，
+         但**只在 word_gap > 0（几何证据没认可）时才用它翻盘**；
+         word_gap == 0 说明几何已经认可，不该被"多数变体"推翻。
+    """
+    ok.sort(key=lambda r: (r['word_gap'], -r['score']))
+    pick = ok[0]
+    agree = [r for r in ok[1:] if r['chars'] == pick['chars']]
+    pick['agreement'] = len(agree)
+    if not agree and len(ok) > 1 and pick['word_gap'] > 0:
+        from collections import Counter
+        cnt = Counter(r['chars'] for r in ok)
+        target = cnt.most_common(1)[0][0]
+        alt = [r for r in ok if r['chars'] == target]
+        alt.sort(key=lambda r: (r['word_gap'], -r['score']))
+        pick = alt[0]
+        pick['agreement'] = len(alt) - 1
+    return pick
+
+
+def ocr_lines(mask_img, variants=None, expect_words=None):
+    """多套预处理跑 OCR 再选。返回 (lines, variants_report, err)。
+
+    选择规则见 `pick_variant`。`expect_words` 给 None 时 word_gap 恒为 0，
+    退化为纯置信度选择（老行为）。
     """
     try:
         from rapidocr_onnxruntime import RapidOCR
@@ -183,41 +285,36 @@ def ocr_lines(mask_img, variants=None):
                           '（Windows 上 onnxruntime 还需 msvcp140_1.dll 与 '
                           'vcruntime140_1.dll；后者 Python 安装目录里自带）' % e)
     engine = RapidOCR()
-    base = mask_img.convert('RGB')
+    base = mask_img.convert('L')
+    vs = variants or OCR_VARIANTS
     report = []
-    for tag, sc, px, py in (variants or OCR_VARIANTS):
+    for tag, sc, px, py, binz in vs:
         try:
-            got = _ocr_once(engine, base, sc, px, py)
+            got = _ocr_once(engine, base, sc, px, py, binz)
         except Exception as e:
             report.append({'variant': tag, 'error': str(e)})
             continue
         txt = ' '.join(t for t, _, _ in got)
         ns = ''.join(c for c in txt if c != ' ')
         score = max((s for _, s, _ in got), default=0.0)
+        nw = len([w for w in txt.split(' ') if w])
         report.append({'variant': tag, 'text': txt, 'chars': len(ns),
-                       'score': round(score, 4), 'lines': len(got)})
+                       'words': nw, 'score': round(score, 4),
+                       'lines': len(got),
+                       'binarize': binz,
+                       # 词数与列投影的距离：越小越可信。给 None 时置 0，
+                       # 让纯置信度模式的行为不变。
+                       'word_gap': (abs(nw - expect_words)
+                                    if expect_words is not None else 0)})
     ok = [r for r in report if r.get('text')]
     if not ok:
         return [], report, None
-    # 投票：置信度最高者，且其字符数要与至少一个其它变体一致
-    ok.sort(key=lambda r: -r['score'])
-    pick = ok[0]
-    agree = [r for r in ok[1:] if r['chars'] == pick['chars']]
-    pick['agreement'] = len(agree)
-    if not agree and len(ok) > 1:
-        # 没有任何变体字符数一致 → 不可信，退而取"被最多变体支持的字符数"
-        from collections import Counter
-        cnt = Counter(r['chars'] for r in ok)
-        target = cnt.most_common(1)[0][0]
-        alt = [r for r in ok if r['chars'] == target]
-        alt.sort(key=lambda r: -r['score'])
-        pick = alt[0]
-        pick['agreement'] = len(alt) - 1
+    pick = pick_variant(ok)
     best_tag = pick['variant']
-    for tag, sc, px, py in (variants or OCR_VARIANTS):
+    for tag, sc, px, py, binz in vs:
         if tag != best_tag:
             continue
-        got = _ocr_once(engine, base, sc, px, py)
+        got = _ocr_once(engine, base, sc, px, py, binz)
         return got, report, None
     return [], report, None
 
@@ -699,6 +796,20 @@ def apply_region(app, page, rec, mm_per_px, layer_suffix, rgb, log=print):
     tgt_y = page_h - y_top_mm
 
     lay = _get_layer(page, rec['region'] + layer_suffix)
+    # **幂等保护**：该图层已有形状就不动它。
+    # 否则重跑同一命令会在同一位置叠出第二个文本——两行字重叠，比不转更糟。
+    # 也不自动清空：用户可能已经改过这里的文字，静默删除等于吃掉他的编辑。
+    # 想重来就先把这一层删掉或改名，或换一个 --live-layer-suffix。
+    try:
+        existing = int(lay.Shapes.Count)
+    except Exception:
+        existing = 0
+    if existing:
+        return {'ok': False,
+                'error': '图层 %r 里已有 %d 个形状，跳过以免叠字。'
+                         '要重做请先删掉该图层，或换一个 --live-layer-suffix'
+                         % (str(lay.Name), existing)}
+
     shp = lay.CreateArtisticText(x_mm, tgt_y, rec['text'])
     if shp is None:
         return {'ok': False, 'error': 'CreateArtisticText 返回空'}
@@ -767,6 +878,63 @@ def apply_region(app, page, rec, mm_per_px, layer_suffix, rgb, log=print):
             'max_error_mm': max(err) if err else None}
 
 
+def _parse_replace(specs):
+    """解析 `--replace-traced` 的 `REGION=LAYER`（可重复）。"""
+    out = {}
+    for s in specs or []:
+        if '=' not in s:
+            raise ValueError('--replace-traced 要写成 REGION=LAYER，收到 %r' % s)
+        k, v = s.split('=', 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _drop_layer_shapes(page, layer_name, log=print):
+    """删掉 `layer_name` 里的全部形状。
+
+    **为什么必须删**：描摹轮廓与活字在**同一位置**。两者叠加等于把这一行字
+    加粗一遍，视觉上比源图重——转活字的意义是"替代轮廓"，不是"再叠一层"。
+
+    **只在活字建好且回读校验通过之后才调**（调用点负责把关）：
+    先删后建的话，一旦建字失败就两头落空，用户的轮廓也没了。
+
+    删完图层空了就连图层一起删——留一个空的 `05_TEXT` 只会让人困惑
+    （文字明明在 `footer_LIVE` 里）。
+    """
+    lay = None
+    for i in range(1, page.Layers.Count + 1):
+        if str(page.Layers.Item(i).Name) == layer_name:
+            lay = page.Layers.Item(i)
+            break
+    if lay is None:
+        # 图层不在。多半是**已经替换过**（上次跑成功、图层被删了），
+        # 也可能是图层名写错。都不该让整轮失败——只报出来，不动退出码。
+        return {'ok': False, 'removed': 0,
+                'error': '没有名为 %r 的图层（可能已经替换过，或图层名写错）'
+                         % layer_name}
+
+    total = int(lay.Shapes.Count)
+    removed = 0
+    # **从后往前删**：正序删会让 Item 索引逐次前移，漏掉一半。
+    for j in range(total, 0, -1):
+        try:
+            lay.Shapes.Item(j).Delete()
+            removed += 1
+        except Exception as e:
+            log('  [警告] 删除 %s 第 %d 个形状失败: %s' % (layer_name, j, e))
+
+    out = {'ok': True, 'layer': layer_name, 'removed': removed, 'was': total}
+    if total and removed == total:
+        try:
+            lay.Delete()
+            out['layer_deleted'] = True
+        except Exception as e:
+            # 删图层不一定支持；空图层留着也不影响几何，不算失败
+            out['layer_deleted'] = False
+            out['layer_delete_error'] = str(e)
+    return out
+
+
 def apply_all(args, summary, log=print):
     """打开/新建 CDR，把 convert 的区域建成活字，保存并回读校验。"""
     import cdr_common as C
@@ -808,6 +976,7 @@ def apply_all(args, summary, log=print):
         log('设置文档状态失败: %s' % e)
         return 1
 
+    repl = _parse_replace(args.replace_traced)
     results = {}
     for name, rec in conv.items():
         log()
@@ -816,6 +985,7 @@ def apply_all(args, summary, log=print):
         r = apply_region(app, page, rec, args.mm_per_px,
                          args.live_layer_suffix, rgb, log)
         results[name] = r
+        rec['apply_result'] = r          # 记进总表，便于事后核对
         if not r['ok']:
             log('  [失败] %s' % r['error'])
             continue
@@ -825,6 +995,25 @@ def apply_all(args, summary, log=print):
         log('  目标 %.4f,%.4f %.4f x %.4f  →  最大误差 %.4f mm'
             % (r['target_mm'][0], r['target_mm'][1],
                r['target_mm'][2], r['target_mm'][3], r['max_error_mm']))
+
+        # 活字建好、位置误差也可接受，才动描摹轮廓。
+        # 误差门槛用 0.05mm：比它大说明活字没落在该在的地方，
+        # 这时候删轮廓等于用一个位置不对的东西替换掉一个位置对的。
+        if name in repl:
+            max_err = r.get('max_error_mm') or 0.0
+            if max_err > 0.05:
+                log('  [跳过替换] 定位误差 %.4f mm > 0.05 mm，'
+                    '保留描摹轮廓更安全' % max_err)
+                r['replaced'] = {'ok': False, 'error': '定位误差过大'}
+            else:
+                log('  删掉描摹轮廓层 %s（活字已就位）' % repl[name])
+                r['replaced'] = _drop_layer_shapes(page, repl[name], log)
+                log('    → %s' % ('已删 %d 个形状%s'
+                                  % (r['replaced']['removed'],
+                                     '，图层已删' if r['replaced'].get('layer_deleted')
+                                     else '，图层保留（空）')
+                                  if r['replaced']['ok']
+                                  else r['replaced']['error']))
 
     try:
         C.release_optimization(app)
@@ -917,6 +1106,12 @@ def main(argv=None):
                     help='活字所在图层的后缀，默认 _LIVE（即 footer_LIVE）')
     ap.add_argument('--live-color', default='#000000',
                     help='活字填充色，默认 #000000')
+    ap.add_argument('--replace-traced', action='append', metavar='REGION=LAYER',
+                    help='建好活字后删掉这个图层里的**描摹轮廓**（可重复）。'
+                         '描摹轮廓与活字同位置，叠加等于把这一行字加粗一遍——'
+                         '转活字的意义是替代它，不是再叠一层。'
+                         '例：--replace-traced footer=05_TEXT。'
+                         '只在活字定位误差 ≤ 0.05mm 时才执行')
     args = ap.parse_args(argv)
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -958,7 +1153,8 @@ def main(argv=None):
         # --- OCR
         crop_img = Image.open(args.image).convert('L').crop(
             (x0 + tx0, y0 + ty0, x0 + tx1, y0 + ty1))
-        lines, ocr_report, err = ocr_lines(crop_img)
+        # 把列投影的词数当**几何证据**交给 OCR 选择器（见 ocr_lines 的说明）
+        lines, ocr_report, err = ocr_lines(crop_img, expect_words=len(words))
         if err:
             print('  [警告] %s' % err)
             ocr_text = ''
@@ -966,10 +1162,11 @@ def main(argv=None):
         else:
             for r in ocr_report:
                 if r.get('error'):
-                    print('    OCR %-12s 失败 %s' % (r['variant'], r['error']))
+                    print('    OCR %-16s 失败 %s' % (r['variant'], r['error']))
                 else:
-                    print('    OCR %-12s 置信 %.3f 字符 %3d  %r'
-                          % (r['variant'], r['score'], r['chars'], r['text']))
+                    print('    OCR %-16s 置信 %.3f 词 %2d(距 %d) 字符 %3d  %r'
+                          % (r['variant'], r['score'], r['words'],
+                             r['word_gap'], r['chars'], r['text']))
             ocr_raw = [{'text': t, 'score': round(s, 4),
                         'box': [[int(p[0]), int(p[1])] for p in bx]}
                        for t, s, bx in lines]

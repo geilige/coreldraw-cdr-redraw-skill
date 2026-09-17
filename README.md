@@ -106,7 +106,7 @@ python skills\coreldraw-x8-redraw\scripts\cdr_bitmap_to_cdr.py ^
 | 易碎标 | 152.539,59.532..194.988,75.924 | 152.474,59.596..195.074,75.924 |
 | 页脚 | 81.274,186.878..145.292,189.121 | 81.252,186.921..145.249,189.703 |
 
-这套判据有**离线回归测试**（`scripts/selftest_offline.py`，95 项断言，不需要
+这套判据有**离线回归测试**（`scripts/selftest_offline.py`，110 项断言，不需要
 CorelDRAW）：用一张几何已知的合成图覆盖残留剥离、外沿外扩、贯通判据、
 行中位数、列切分、超采样度量等每一处坑，改坏了立刻报出来。
 
@@ -183,17 +183,36 @@ X8 内置 PowerTRACE 的宏接口**能跑**，但质量差一个量级，所以�
 - 重建为 **1 个文本对象**，文字可编辑；而描摹轮廓是 73 子路径 / 840 段
 
 ```powershell
+# 只看识别与判定，不碰 CorelDRAW
 python skills\coreldraw-x8-redraw\scripts\cdr_text_live.py ^
-  --image ref.png --region footer=0,17,0,372 ^
+  --image ref.png --region footer=1083,1100,470,842 ^
   --mm-per-px 0.17256 --out-dir out\text
 
-# 加 --apply 才真的在 CorelDRAW 里建活字（建在 footer_LIVE 图层）
+# 真的建活字，并删掉该区的描摹轮廓
 python skills\coreldraw-x8-redraw\scripts\cdr_text_live.py ^
-  --image ref.png --region footer=0,17,0,372 ^
-  --mm-per-px 0.17256 --out-dir out\text --apply out\live.cdr
+  --image ref.png --region footer=1083,1100,470,842 ^
+  --mm-per-px 0.17256 --out-dir out\text ^
+  --apply out\cover.cdr --replace-traced footer=05_TEXT
 ```
 
-**但默认不自动替换描摹轮廓**——字体猜错比描摹失真更糟。必须看产出的 `verdict`：
+`--region` 的坐标直接用流水线报告「分区与参数」表的「源框 px」列。
+
+**⚠️ `--replace-traced` 不是可选项。** 描摹轮廓与活字在**同一位置**，叠加等于
+把这一行字加粗一遍。实测同一页脚：
+
+| 方案 | 区域 IoU | 墨迹比 |
+| --- | --- | --- |
+| 描摹轮廓（原状） | **92.82%** | 1.046 |
+| 活字（替代） | 70.50% | 1.141 |
+| 两者叠加（不替换） | 77.70% | **1.286** |
+
+叠加**两头不讨好**：IoU 比描摹轮廓低，墨迹比还比源图粗 28.6%。
+所以"保留轮廓当保险"是错的。删除只在活字定位误差 ≤ 0.05mm 之后才执行。
+
+整页影响很小（页脚只占 371×16 px / 1217×1660）：**94.65% → 94.49%**，
+即用 0.16 个百分点的整页还原度换这一行字可编辑。
+
+**字体猜错比描摹失真更糟**，所以必须看产出的 `verdict`：
 
 | `verdict` | `reject_kind` | 含义与处置 |
 | --- | --- | --- |
@@ -202,15 +221,29 @@ python skills\coreldraw-x8-redraw\scripts\cdr_text_live.py ^
 | `keep_trace` | `not_text` | **这块根本不是一行文字**，该去查区域切分 |
 
 活字**单独放 `<区名>_LIVE` 图层**，与描摹轮廓分层——万一猜错，用户能一眼看出
-是哪一层、整层删掉即可。
+是哪一层、整层删掉即可。该图层里已有形状时会**直接跳过**，不叠字也不自动清空。
 
-四个关键设计点：
+五个关键设计点：
 
-1. **OCR 要跑多套预处理投票**。实测同一张图，`2× + 20px 四周留白`出乱码、
-   `2× + 纵向 0 留白`出正确答案——没有一套参数对所有图都稳。
+1. **OCR 必须二值化，而且不能按置信度选变体**。这一条是踩坑踩出来的：早期
+   "验证通过"跑在一个人工做的测试裁切上，那个裁切恰好是**二值图**，所以看起来
+   一切正常；换回**源图直裁**后 OCR 立刻失效。实测同一区域同一裁切框：
+
+   | 预处理 | 变体数 | 完全正确 |
+   | --- | --- | --- |
+   | 原始灰度 | 4 | **0** |
+   | 二值化（118 / 128 / Otsu） | 12 | **7** |
+
+   灰度全错，且错法一致（`O.V.D.` 大小写错、词间空格被吃掉）。原因是低分辨率
+   扫描件的笔画边缘全是抗锯齿，检测器分不清字间浅灰缝隙。更关键的是
+   **错误的灰度变体置信度反而最高**（0.921 vs 正确 0.918），所以选择器改用
+   **列投影切出的词数**——独立于 OCR 的几何证据，实测 100% 分对；
+   置信度只用于打破平局。
+   > 教训：**模型自报的置信度不能当选择依据**；**测试夹具不能比真实输入更"干净"**。
+
 2. **相似度不能用绝对 IoU 门槛**。16px 小字即使文本与字体都对，IoU 也只有 0.61；
    用 0.62 的绝对门槛会把完美匹配也拒掉。改用 `lift = 最佳 ÷ 候选中位`（与字号无关）。
-3. **但光有相似度不够，必须补"这是不是文字"的硬门槛**。这一条是踩坑踩出来的：
+3. **但光有相似度不够，必须补"这是不是文字"的硬门槛**。这一条也是踩坑踩出来的：
    把工具插图区当文字区喂进来时，OCR 幻觉出 `'wander'`（6 个字），
    `lift = 1.53`、`IoU = 0.386` —— **两个相似度判据全过**，于是在 CDR 里
    建了一行 `'wander'`。根因是 lift 与 IoU 都在"横向拉伸到同宽"**之后**算，
@@ -326,7 +359,7 @@ python skills\coreldraw-x8-redraw\scripts\cdr_redraw.py ^
   --source input.cdr --output outputs\redraw_exact.cdr --mode clone
 ```
 
-**离线回归测试**（不需要 CorelDRAW，95 项断言）：
+**离线回归测试**（不需要 CorelDRAW，110 项断言）：
 
 ```powershell
 python skills\coreldraw-x8-redraw\scripts\selftest_offline.py
@@ -350,7 +383,7 @@ skills/coreldraw-x8-redraw/
 │   ├── cdr_prompt_builder.py         生成文件专属重绘提示词
 │   ├── cdr_redraw.py                 形状级精确重建与结构校验
 │   ├── cdr_common.py                 COM 连接、重试、遍历、统计
-│   └── selftest_offline.py           离线回归测试（95 项断言，含自动分区合成图、活字判定）
+│   └── selftest_offline.py           离线回归测试（110 项断言，含自动分区合成图、活字判定、OCR 预处理）
 └── references/
     ├── raster-to-vector-notes.md     ★ 位图矢量化必读（实测踩坑结论）
     │                                 §9 = 内置 PowerTRACE 完整实测

@@ -216,10 +216,18 @@ python scripts\cdr_bitmap_to_cdr.py --report-only --out-dir out\ref_work ^
 
 ```bash
 python scripts\cdr_text_live.py --image 源图.png ^
-    --region footer=0,17,0,372 --mm-per-px 0.17256 --out-dir out\text
+    --region footer=1083,1100,470,842 --mm-per-px 0.17256 --out-dir out\text
 ```
 
-加 `--apply out\live.cdr` 才真的在 CorelDRAW 里建活字（建在 `<区名>_LIVE` 图层）。
+`--region` 的坐标直接用流水线报告「分区与参数」表的「源框 px」列。
+
+加 `--apply out\cover.cdr --replace-traced footer=05_TEXT` 才真的建活字
+（建在 `<区名>_LIVE` 图层，并**删掉该区的描摹轮廓**）。
+
+**⚠️ `--replace-traced` 不是可选项。** 描摹轮廓与活字同位置，叠加等于把这一行
+字加粗一遍。实测同一页脚：描摹轮廓 IoU 92.82%／墨迹比 1.046，
+活字 70.50%／1.141，**叠加 77.70%／1.286（比源图粗 28.6%）**——
+叠加两头不讨好。删除只在活字定位误差 ≤ 0.05mm 之后才执行。
 
 产出 `live_text.json`（含逐区文本、选定字体、IoU、lift、**四条判据的取值**、判定）、
 `font_match_<区>.json`、`compare_<区>.png` 三联对照图。
@@ -229,21 +237,32 @@ python scripts\cdr_text_live.py --image 源图.png ^
 - `keep_trace` + `reject_kind=weak_match` → 保留轮廓，报告里列出库里最接近的候选；
 - `keep_trace` + `reject_kind=not_text` → **这块根本不是一行文字**，该去查区域切分。
 
-四个关键设计点（详见 `references/live-text-design.md`）：
+五个关键设计点（详见 `references/live-text-design.md`）：
 
-1. **OCR 要跑多套预处理投票**。实测同一张图，2×+20px 留白出乱码、
-   2×+纵向 0 留白出正确答案——**没有一套参数对所有图都稳**。
-2. **相似度不能用绝对 IoU 门槛**。16px 小字即使文本与字体都对，IoU 也只有 0.61；
+1. **OCR 必须二值化，而且不能按置信度选变体**。实测同一区域同一裁切框：
+   喂原始灰度 **4 套变体全错**（`O.V.D.` 大小写错、词间空格被吃掉）；
+   喂二值图 **12 套里 7 套完全正确**。原因是低分辨率扫描件的笔画边缘全是
+   抗锯齿，检测器分不清字间浅灰缝隙。更关键的是**错误的灰度变体置信度反而
+   最高**（0.921 vs 正确 0.918），所以选择器改用**列投影切出的词数**
+   （独立于 OCR 的几何证据，实测 100% 分对），置信度只用于打破平局。
+   教训：**模型自报的置信度不能当选择依据**。
+2. **多套预处理 + 多套留白**。2×+20px 留白出乱码、2×+纵向 0 留白出正确答案——
+   **没有一套参数对所有图都稳**。
+3. **相似度不能用绝对 IoU 门槛**。16px 小字即使文本与字体都对，IoU 也只有 0.61；
    用 0.62 的绝对门槛会把完美匹配也拒掉。改用 `lift = 最佳 ÷ 候选中位`（与字号无关）。
-3. **但光有相似度不够，必须补"这是不是文字"的硬门槛**。实测把工具插图区
+4. **但光有相似度不够，必须补"这是不是文字"的硬门槛**。实测把工具插图区
    当文字区喂进来，OCR 幻觉出 `'wander'`，lift 1.53、IoU 0.386 **两个相似度判据
    全过**，于是在 CDR 里建了一行 `'wander'`。根因：lift 与 IoU 都在"横向拉伸到
    同宽"**之后**算，而拉伸本身就把最大的差异抹掉了。补两条与字号无关的比值：
    **分量数÷字符数**（真文字 1.10 / 误判区 11.00）与**自然宽度比**
    （真文字 0.987 / 误判区 1.887），两条都过才允许转。
-4. **易混符号直接量字形**（`•` 宽高比 1.25/密度 0.80 vs `-` 宽高比 4.00），
+5. **易混符号直接量字形**（`•` 宽高比 1.25/密度 0.80 vs `-` 宽高比 4.00），
    大小写改动才走整体 IoU 逐词裁决——因为单个窄字形只占整行约 1% 面积，
    全局 IoU 分不出来。
+
+**⚠️ 验证时一定要用真正的源图**。早期"验证通过"跑在一个人工做的测试裁切上，
+那个裁切恰好是**二值图**（PIL mode `1`），所以看起来一切正常；
+换回源图直裁后 OCR 立刻失效。**测试夹具不能比真实输入更"干净"**。
 
 ## 判断还原度：不要靠眼睛
 
@@ -471,12 +490,12 @@ python scripts\cdr_visual_diff.py --source ref.png ^
 
 ```text
 python scripts\cdr_text_live.py --image ref.png ^
-  --region footer=0,17,0,372 --mm-per-px 0.17256 --out-dir out\text
+  --region footer=1083,1100,470,842 --mm-per-px 0.17256 --out-dir out\text
 python scripts\cdr_text_live.py --image ref.png --region "t:0,20,0,400" ^
   --mm-per-px 0.17256 --out-dir out\text --corel-only
 python scripts\cdr_text_live.py --image ref.png ^
-  --region footer=0,17,0,372 --mm-per-px 0.17256 --out-dir out\text ^
-  --apply out\live.cdr            # 真的建活字（建在 footer_LIVE 图层）
+  --region footer=1083,1100,470,842 --mm-per-px 0.17256 --out-dir out\text ^
+  --apply out\cover.cdr --replace-traced footer=05_TEXT
 ```
 
 产出 `live_text.json`（逐区文本 / 选定字体 / IoU / lift / **四条判据取值** / 判定）、
@@ -502,7 +521,7 @@ python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cd
 ```text
 python -m pip install numpy opencv-python pillow potracer
 python -m pip install pywin32          # 只有要建 CDR 时才需要
-python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线回归测试（95 项断言）
+python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线回归测试（110 项断言）
 ```
 
 文字转活字另需 OCR（离线，无需联网）：
@@ -521,11 +540,13 @@ Windows 上 `onnxruntime` 还缺 `vcruntime140_1.dll` 与 `msvcp140_1.dll`
 `selftest_offline.py` 覆盖三块：纯逻辑（提示词渲染、CDR 结构比对）；
 **用一张几何已知的合成图**验证自动分区的每一处坑（残留剥离、外沿外扩、
 满版色带贯通判据、行中位数、列方向切分、超采样度量的偏差量级）；
-以及文字转活字的判定（连通分量、文字/线稿的统计特征、四条判据的边界，
-夹具用的是**实测值**而不是编的数）。
+文字转活字的判定（连通分量、文字/线稿的统计特征、四条判据的边界），
+以及 OCR 的预处理与变体选择（Otsu 平台期、二值化极性、变体选择规则）。
+**夹具全部用实测值而不是编的数**——包括那张"置信度会选错"的变体表。
 
 改动 `auto_partition` / `strip_residue` / `_tighten` / `rasterize` /
-`cc_sizes` / `decide_convert` 之后**必须重跑它**——这些函数的错误在真实图上
+`cc_sizes` / `decide_convert` / `_otsu_gray` / `binarize` / `pick_variant`
+之后**必须重跑它**——这些函数的错误在真实图上
 往往只表现为"某块内容描歪了""多了一行不该有的文字"，肉眼很难定位。
 
 ## 参考文档

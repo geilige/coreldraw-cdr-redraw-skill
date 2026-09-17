@@ -572,6 +572,105 @@ def test_decide_convert():
           d["verdict"] == "keep_trace", str(d["checks"]))
 
 
+def test_otsu_gray():
+    """Otsu 的平台期必须取中点——取第一个最大值会把阈值落在峰边缘上。
+
+    实测踩过：一张只有 40 与 220 两个灰度的图，类间方差在 t=40..219 上
+    **完全相等**，严格大于保留第一个就返回 40，`a < 40` 一个像素都不剩，
+    二值图全白，OCR 直接失效。这和"参数有平台期时不能只比两个点"同类。
+    """
+    two = np.concatenate([np.full(500, 40, np.uint8),
+                          np.full(500, 220, np.uint8)]).reshape(25, 40)
+    t = L._otsu_gray(two)
+    check("双峰图 Otsu 取平台中点（129），不是峰边缘（40）", t == 129, f"得到 {t}")
+    b = np.asarray(L.binarize(Image.fromarray(two), 'otsu')) < 128
+    check("双峰图二值后墨迹占比 ≈ 0.5（不是 0 或 1）",
+          near(float(b.mean()), 0.5, 0.01), f"得到 {float(b.mean()):.3f}")
+
+    three = np.concatenate([np.full(300, 30, np.uint8), np.full(400, 128, np.uint8),
+                            np.full(300, 240, np.uint8)]).reshape(20, 50)
+    check("三峰图不崩且阈值落在中间带",
+          30 < L._otsu_gray(three) < 240, str(L._otsu_gray(three)))
+
+    check("全同灰度返回 128（不除零）",
+          L._otsu_gray(np.full((5, 5), 200, np.uint8)) == 128)
+    check("空图返回 128（不崩）", L._otsu_gray(np.zeros((0, 0), np.uint8)) == 128)
+
+
+def test_binarize_polarity():
+    """二值化的极性保护：反白字不该被二值成一团黑。"""
+    dark_text = np.full((20, 60), 240, np.uint8)
+    dark_text[5:15, 10:20] = 30
+    b = np.asarray(L.binarize(Image.fromarray(dark_text), 128)) < 128
+    check("深字浅底：墨迹就是字",
+          near(float(b.mean()), 100 / 1200.0, 0.01), f"{float(b.mean()):.3f}")
+
+    inv = np.asarray(L.binarize(Image.fromarray(255 - dark_text), 128)) < 128
+    check("浅字深底（反白）：极性保护后墨迹仍是字，不是整块",
+          near(float(inv.mean()), 100 / 1200.0, 0.01), f"{float(inv.mean()):.3f}")
+    check("反白输入的二值结果与正相输入一致",
+          bool((b == inv).all()))
+
+
+def test_pick_variant():
+    """OCR 变体选择：**必须用列投影的词数，不能用置信度**。
+
+    夹具是实测值（源图直裁 371x16 页脚，真值 9 词 / 48 字符）：
+
+        变体              置信    词数  词距  正确?
+        4x_20留白         0.921    7     2     ✗   ← 置信度最高
+        2x_二值118        0.918    9     0     ✓
+        4x_二值118        0.918    9     0     ✓
+        ...
+
+    按置信度选会选到错误的那一个（0.921 > 0.918）。这是"置信度是自报的，
+    列投影是独立几何证据"的直接证据。
+    """
+    def V(tag, score, words, chars, gap):
+        return {'variant': tag, 'text': 'x' * chars, 'chars': chars,
+                'words': words, 'score': score, 'lines': 1,
+                'word_gap': gap}
+
+    real = [
+        V('1x_宽留白', 0.893, 1, 48, 8),
+        V('2x_无纵留白', 0.885, 3, 47, 6),
+        V('2x_微纵留白', 0.897, 7, 48, 2),
+        V('3x_20留白', 0.894, 5, 47, 4),
+        V('4x_20留白', 0.921, 7, 48, 2),      # 置信度最高但错
+        V('2x_二值118', 0.918, 9, 48, 0),
+        V('4x_二值118', 0.918, 9, 48, 0),
+        V('2x_二值128', 0.908, 9, 48, 0),
+        V('4x_二值128', 0.917, 9, 48, 0),
+        V('4x_二值Otsu', 0.907, 9, 48, 0),
+        V('1x_二值118_宽留白', 0.894, 9, 48, 0),
+    ]
+    pick = L.pick_variant([dict(r) for r in real])
+    check("选出词距为 0 的变体，而不是置信度最高的那个",
+          pick['word_gap'] == 0, f"选出 {pick['variant']} gap={pick['word_gap']}")
+    check("选出的变体确实是二值化那套", '二值' in pick['variant'],
+          pick['variant'])
+    check("词距为 0 的变体置信度（0.918）低于被淘汰的（0.921）——"
+          "说明判据真的不是置信度",
+          pick['score'] < max(r['score'] for r in real),
+          f"{pick['score']} vs {max(r['score'] for r in real)}")
+    check("同词距时取置信度更高者（0.918 > 0.917 > 0.908）",
+          near(pick['score'], 0.918, 1e-9), str(pick['score']))
+
+    # 旧行为：不给几何证据时退化为按置信度选 —— 会选错，记录这一点防止回退
+    old = [dict(r, word_gap=0) for r in real]
+    check("不给词数证据时按置信度选，会选到错误的 4x_20留白（旧行为，已废弃）",
+          L.pick_variant(old)['variant'] == '4x_20留白')
+
+    # 几何证据本身失效（词距全 >0）时才允许"多数变体字符数"翻盘
+    allbad = [V('a', 0.9, 5, 48, 3), V('b', 0.8, 6, 47, 2),
+              V('c', 0.7, 7, 47, 1), V('d', 0.6, 8, 47, 4)]
+    check("词距全 >0 时退而取被最多变体支持的字符数（47）",
+          L.pick_variant([dict(r) for r in allbad])['chars'] == 47)
+
+    check("单个变体也能选（不崩）",
+          L.pick_variant([V('only', 0.5, 9, 48, 0)])['variant'] == 'only')
+
+
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
@@ -604,6 +703,13 @@ def main():
     test_glyph_stats()
     print()
     test_decide_convert()
+
+    print("\n=== D. OCR 预处理与变体选择（纯逻辑）===")
+    test_otsu_gray()
+    print()
+    test_binarize_polarity()
+    print()
+    test_pick_variant()
 
     print()
     if _FAILED:

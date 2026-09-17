@@ -211,20 +211,29 @@ Application
 
 ### cdrUnit（`Document.Unit`）
 
-| 值 | 名称 |
-| --- | --- |
-| 1 | `cdrTenthMicron` |
-| 2 | `cdrInch` |
-| 3 | `cdrFoot` |
-| 4 | `cdrMillimeter` |
-| 5 | `cdrCentimeter` |
-| 6 | `cdrPica` |
-| 7 | `cdrPoint` |
-| 10 | `cdrPixel` |
-| 11 | `cdrMeter` |
+> **⚠️ 本表曾经写错，已按实测改正。** 旧版写的是
+> `1=cdrTenthMicron / 2=cdrInch / 3=cdrFoot / 4=cdrMillimeter / 5=cdrCentimeter`，
+> 整体错位。那是从文档/记忆里抄的，**没有实测**。
+> 实测方法：把 `doc.Unit` 依次设成 1..5，读同一个页面（真实尺寸 210 × 286.4421 mm）
+> 的 `SizeWidth/SizeHeight`，看哪个值给出毫米数：
 
-> 由于单位枚举存在版本差异，脚本在设置目标文档单位时**直接复制源文档的原始
-> 单位代码**，避免误判。
+| 值 | 实测 `SizeWidth` | 结论 | 名称 |
+| --- | --- | --- | --- |
+| 1 | 8.2677 | 210mm = 8.2677 in | `cdrInch` |
+| 2 | 0.6890 | 8.2677/12 | `cdrFoot` |
+| **3** | **210.0000** | **就是毫米** | **`cdrMillimeter`** |
+| 4 | 21.0000 | 210mm = 21cm | `cdrCentimeter` |
+| 5 | 2480.3150 | 210mm @300dpi | `cdrPixel` |
+
+所以 **`cdrMillimeter = 3`**（`cdr_image_place.py` 里的注释是对的，本表旧版是错的）。
+`cdr_text_live.py` 也按 3 用。
+
+**教训**：单位枚举这类"查一下就知道"的常量，必须**实测一遍**再写进文档。
+写错不会立刻报错，只会让所有坐标整体缩放——症状是"形状跑到页面外"或
+"小得看不见"，而不是抛异常，排查起来很费时。
+
+> 另注：`Document.Unit` 会随文件保存。实测同一个 CDR 重开时读到的是保存时的值。
+> 但**不要依赖这一点**：脚本每次动几何之前都显式设一次 `doc.Unit = 3`。
 
 ### cdrAlignType（对齐）
 
