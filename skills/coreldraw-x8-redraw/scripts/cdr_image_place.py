@@ -1,0 +1,332 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""按描摹清单在 CorelDRAW 中构建 CDR，并导出预览。
+
+读 cdr_image_trace.py 产出的 manifest.json，把每个区域的 SVG 导入指定图层，
+按清单尺寸缩放、按清单包围盒左上角定位，另可附加原生矢量矩形（色带/底块）。
+最后保存 CDR、导出预览图，并写出 placement.json 供校验脚本使用。
+
+依赖: pywin32（需要本机安装完整版 CorelDRAW X8 或更高）
+    python -m pip install pywin32
+
+--------------------------------------------------------------------------
+CorelDRAW X8 上的实测要点（改动前先读）
+--------------------------------------------------------------------------
+1. 连接用 Dispatch("CorelDRAW.Application.18")。GetActiveObject 在 X8 上常抛
+   com_error(-2147221021, '操作无法使用')（MK_E_UNAVAILABLE），不要依赖它。
+   Dispatch 会复用已打开的实例，不会另开一个。
+2. **可选 VT_DISPATCH 参数会让 win32com 抛
+   TypeError: The Python instance can not be converted to a COM object。**
+   凡是签名里带可选对象参数的调用，末尾都要显式补 None：
+       doc.SaveAs(path, None)
+       lay.Import(svg_path, 0, None)
+       doc.Export(png_path, filter_id, 1, None, None)
+3. **ExportEx 在 X8 上会"返回成功但不写文件"。** 以 Export 为主，并且必须
+   用 os.path.exists + 文件大小确认，不能只看有没有抛异常。
+4. 导出位图滤镜常量：PNG = 802。颜色模式 RGB = 4。
+5. 单位常量：cdrMillimeter = 3（不是 4）。页面方向 cdrPortrait = 0。
+6. 参考点常量：cdrTopLeft = 3。设 doc.ReferencePoint = 3 之后，
+   SetPosition(x, y) 就是"左上角坐标"。
+7. **CorelDRAW 的 y 轴向上**，而设计稿习惯以左上为原点。转换：
+       y_cdr = page_height_mm - y_top_mm
+8. Layer.Import 不返回形状对象，导入的形状会**追加到该图层末尾**。
+   取回方式：lay.Shapes.Item(lay.Shapes.Count)，并用导入前后 Count 是否增加来校验。
+9. 集合索引是 **1 基**：Shapes(1)、Pages(1)、Layers(1)。
+10. page.Shapes.All 是**方法**，要写成 page.Shapes.All().Count。
+11. 批量操作前 app.Optimization = True、app.EventsEnabled = False；
+    结束后必须复位并 app.Refresh()，否则画面不刷新、文件可能没落盘。
+12. 新建文档默认带一个"图层 1"，直接改名复用，避免多出一个空图层。
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+CDR_MM = 3            # cdrMillimeter
+CDR_PORTRAIT = 0
+CDR_TOPLEFT = 3
+CDR_PNG = 802
+CDR_RGB = 4
+
+
+def indexed(i, name):
+    """给图层名加两位序号前缀；已经带序号（如 03_LOGO）的原样保留。"""
+    return name if re.match(r"^\d+_", name) else f"{i:02d}_{name}"
+
+
+def parse_rect(spec):
+    """name:x,y,w,h,color  ->  (name, dict)。y 是距页面顶部的毫米。"""
+    name, rest = spec.split(":", 1)
+    p = [t.strip() for t in rest.split(",")]
+    if len(p) < 5:
+        raise ValueError(f"矩形格式应为 name:x,y,w,h,color，收到 {spec!r}")
+    color = p[4].lstrip("#")
+    return name, {
+        "x": float(p[0]), "y": float(p[1]),
+        "w": float(p[2]), "h": float(p[3]),
+        "rgb": tuple(int(color[i:i + 2], 16) for i in (0, 2, 4)),
+    }
+
+
+def parse_map(specs):
+    """name=LAYER 或 name=white 之类的键值对列表。"""
+    out = {}
+    for s in specs or []:
+        if "=" not in s:
+            raise ValueError(f"映射格式应为 区域=值，收到 {s!r}")
+        k, v = s.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="按描摹清单在 CorelDRAW 中构建 CDR",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--manifest", required=True, help="manifest.json 路径")
+    ap.add_argument("--output", required=True, help="输出 CDR 路径")
+    ap.add_argument("--preview", default=None, help="预览 PNG 路径（省略则不导出）")
+    ap.add_argument("--progid", default="CorelDRAW.Application.18",
+                    help="CorelDRAW ProgID，默认 CorelDRAW.Application.18")
+    ap.add_argument("--rect", action="append", default=[],
+                    help="附加原生矢量矩形 name:x,y,w,h,#RRGGBB（y 为距页顶毫米），"
+                         "可重复，按给定顺序先画（垫底）")
+    ap.add_argument("--layer", action="append", default=[],
+                    help="图层映射 区域名=图层名，可重复；缺省用区域名大写")
+    ap.add_argument("--white", action="append", default=[],
+                    help="需要填白的区域名（深底上的白色字标），可重复")
+    ap.add_argument("--layer-order", default=None,
+                    help="图层自下而上的顺序，逗号分隔；缺省按区域出现顺序")
+    ap.add_argument("--reuse-layer1", default="图层 1",
+                    help="复用新建文档自带的图层名（默认 '图层 1'）")
+    ap.add_argument("--close-existing", default="",
+                    help="构建前关闭名称以这些前缀开头的已打开文档，逗号分隔")
+    ap.add_argument("--keep-optimization", action="store_true",
+                    help="结束后不复位 Optimization/EventsEnabled（调试用）")
+    args = ap.parse_args(argv)
+
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError:
+        print("缺少 pywin32。请先执行: python -m pip install pywin32", file=sys.stderr)
+        return 1
+
+    if not os.path.isfile(args.manifest):
+        print(f"找不到清单: {args.manifest}", file=sys.stderr)
+        return 1
+
+    # CorelDRAW 的 SaveAs/Export 会按它自己的工作目录解析相对路径，
+    # 必须先把所有输出路径转成绝对路径，否则文件会落到意外位置。
+    args.manifest = os.path.abspath(args.manifest)
+    args.output = os.path.abspath(args.output)
+    if args.preview:
+        args.preview = os.path.abspath(args.preview)
+
+    with open(args.manifest, encoding="utf-8") as f:
+        man = json.load(f)
+    regions = man.get("regions", {})
+    if not regions:
+        print("清单里没有任何区域。", file=sys.stderr)
+        return 1
+
+    page_w, page_h = man["page_mm"][0], man["page_mm"][1]
+    layer_map = parse_map(args.layer)
+    white_set = set(args.white)
+
+    rects = [parse_rect(s) for s in args.rect]
+
+    # 图层自下而上的顺序：先矩形所在图层，再各区域图层
+    order = []
+    if args.layer_order:
+        order = [t.strip() for t in args.layer_order.split(",") if t.strip()]
+    else:
+        order = ["RECT"] + [layer_map.get(n, n.upper()) for n in regions]
+
+    out_dir = os.path.dirname(args.output)
+    os.makedirs(out_dir, exist_ok=True)
+
+    pythoncom.CoInitialize()
+    try:
+        app = win32com.client.Dispatch(args.progid)
+    except Exception as exc:
+        print(f"无法连接 CorelDRAW（{args.progid}）: {type(exc).__name__}: {exc}\n"
+              "请确认已安装完整版 CorelDRAW 且已至少启动过一次。", file=sys.stderr)
+        return 1
+
+    print(f"CorelDRAW {app.VersionMajor}.{app.VersionMinor}")
+
+    try:
+        app.Visible = True
+        app.Optimization = True          # 要点 11
+        app.EventsEnabled = False
+    except Exception:
+        pass
+
+    if args.close_existing:
+        prefixes = tuple(t.strip() for t in args.close_existing.split(",") if t.strip())
+        for i in range(app.Documents.Count, 0, -1):
+            try:
+                d = app.Documents.Item(i)
+                if str(d.Name).startswith(prefixes):
+                    d.Close()
+            except Exception:
+                pass
+
+    doc = app.CreateDocument()
+    doc.Unit = CDR_MM
+    doc.SaveAs(args.output, None)        # 要点 2
+    page = doc.ActivePage
+    page.SetSize(page_w, page_h)
+    page.Orientation = CDR_PORTRAIT
+    print(f"页面 {page.SizeWidth:.3f} x {page.SizeHeight:.3f} mm，单位代码 {doc.Unit}")
+
+    def cdr_y(top_mm):
+        return page_h - top_mm           # 要点 7
+
+    def layer(name, reuse=None):
+        for i in range(1, page.Layers.Count + 1):
+            lay = page.Layers.Item(i)
+            if reuse and str(lay.Name) == reuse:
+                lay.Name = name
+                return lay
+            if str(lay.Name) == name:
+                return lay
+        return page.CreateLayer(name)
+
+    # 先建全部图层，保证 z 序 = order 顺序
+    layers = {}
+    for idx, lname in enumerate(order, 1):
+        nm = indexed(idx, lname)
+        layers[lname] = layer(nm, reuse=args.reuse_layer1 if idx == 1 else None)
+    print("图层（自下而上）:",
+          [page.Layers.Item(i).Name for i in range(1, page.Layers.Count + 1)])
+
+    placed = []
+
+    for name, r in rects:
+        lay = layers["RECT"]
+        sh = lay.CreateRectangle2(r["x"], cdr_y(r["y"] + r["h"]), r["w"], r["h"])
+        sh.Fill.ApplyUniformFill(app.CreateRGBColor(*r["rgb"]))
+        sh.Outline.SetNoOutline()
+        sh.Name = name
+        placed.append({"name": name, "kind": "rect", "layer": lay.Name,
+                       "bbox_mm": [r["x"], r["y"], r["x"] + r["w"], r["y"] + r["h"]]})
+        print(f"{name:14s} 矩形 x{r['x']:8.3f} y{r['y']:8.3f} "
+              f"{r['w']:7.3f}x{r['h']:7.3f}")
+
+    print()
+    for key, info in regions.items():
+        lname = layer_map.get(key, key.upper())
+        if lname not in layers:
+            layers[lname] = layer(indexed(len(layers) + 1, lname))
+        lay = layers[lname]
+
+        svg = info["svg"]
+        if not os.path.isfile(svg):
+            print(f"{key:14s} [跳过] 找不到 {svg}")
+            continue
+
+        before = lay.Shapes.Count
+        lay.Import(svg, 0, None)          # 要点 2/8
+        if lay.Shapes.Count == before:
+            print(f"{key:14s} [失败] 导入后图层形状数未增加")
+            continue
+        sh = lay.Shapes.Item(lay.Shapes.Count)
+
+        tw, th = info["size_mm"]
+        sh.SetSize(tw, th)
+        x0, y0 = info["bbox_mm"][0], info["bbox_mm"][1]
+        doc.ReferencePoint = CDR_TOPLEFT  # 要点 6
+        sh.SetPosition(x0, cdr_y(y0))
+
+        if key in white_set:
+            sh.Fill.ApplyUniformFill(app.CreateRGBColor(255, 255, 255))
+            sh.Outline.SetNoOutline()
+
+        doc.ReferencePoint = CDR_TOPLEFT
+        px, py = sh.PositionX, sh.PositionY
+        err_x = abs(px - x0)
+        err_y = abs((page_h - py) - y0)
+        flag = "OK" if err_x < 0.02 and err_y < 0.02 else "偏差"
+        print(f"{key:14s} 目标 x{x0:8.3f} y{y0:8.3f} {tw:7.3f}x{th:7.3f}  |  "
+              f"实际 x{px:8.3f} y{page_h-py:8.3f} "
+              f"{sh.SizeWidth:7.3f}x{sh.SizeHeight:7.3f}  "
+              f"误差 {err_x:.3f}/{err_y:.3f} mm  [{flag}]  类型{sh.Type}")
+
+        placed.append({
+            "name": key, "kind": "svg", "layer": lay.Name,
+            "bbox_mm": [x0, y0, x0 + tw, y0 + th],
+            "size_mm": [tw, th],
+            "error_mm": [round(err_x, 4), round(err_y, 4)],
+        })
+
+    if not args.keep_optimization:
+        try:
+            app.Optimization = False
+            app.EventsEnabled = True
+            app.Refresh()
+        except Exception:
+            pass
+
+    doc.Save()
+    if not os.path.isfile(args.output):
+        print(f"[失败] 保存后找不到文件: {args.output}\n"
+              f"       请检查路径是否可写，或用 doc.SaveAs 另存到其他位置。",
+              file=sys.stderr)
+        return 2
+    size = os.path.getsize(args.output)
+    print(f"\n已保存 {args.output}  ({size} 字节)")
+
+    # 记录内容并集包围盒，供校验脚本把渲染图贴回页面
+    xs = [p["bbox_mm"][0] for p in placed] + [p["bbox_mm"][2] for p in placed]
+    ys = [p["bbox_mm"][1] for p in placed] + [p["bbox_mm"][3] for p in placed]
+    placement = {
+        "cdr": os.path.abspath(args.output),
+        "page_mm": [page_w, page_h],
+        "content_bbox_mm": [min(xs), min(ys), max(xs), max(ys)] if placed else None,
+        "items": placed,
+        "source_image": man.get("source_image"),
+    }
+    pp = os.path.join(out_dir, "placement.json")
+    with open(pp, "w", encoding="utf-8") as f:
+        json.dump(placement, f, ensure_ascii=False, indent=2)
+    print(f"定位记录: {pp}")
+
+    if args.preview:
+        # 要点 3：ExportEx 在 X8 上不可靠，以 Export 为准，并且必须验文件
+        if os.path.exists(args.preview):
+            os.remove(args.preview)
+        ok = False
+        for label, fn in (("Export", lambda: doc.Export(args.preview, CDR_PNG, 1, None, None)),
+                          ("ExportEx", lambda: doc.ExportEx(args.preview, CDR_PNG, 1, None, None))):
+            if ok:
+                break
+            try:
+                fn()
+            except Exception as exc:
+                print(f"[FAIL] {label}: {type(exc).__name__}: {exc}")
+                continue
+            if os.path.exists(args.preview) and os.path.getsize(args.preview) > 0:
+                print(f"[OK] {label} 导出预览 {args.preview} "
+                      f"({os.path.getsize(args.preview)} 字节)")
+                ok = True
+            else:
+                print(f"[FAIL] {label} 未写出文件（X8 已知问题，改用 Export）")
+        if not ok:
+            print("[警告] 预览导出失败；可直接用 doc.Export 手动另存为 PNG。")
+
+    print()
+    print("=== 汇总 ===")
+    print(f"页面 {page.SizeWidth:.2f} x {page.SizeHeight:.2f} mm，"
+          f"活动页形状 {page.Shapes.All().Count}")
+    for i in range(1, page.Layers.Count + 1):
+        lay = page.Layers.Item(i)
+        print(f"  {lay.Name:12s} {lay.Shapes.Count:3d} 个形状")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

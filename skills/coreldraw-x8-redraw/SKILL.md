@@ -1,19 +1,25 @@
 ---
 name: coreldraw-x8-redraw
-description: 通过 COM 自动化操作 CorelDRAW X8（及更高版本），剖析、精确重绘并校验 CDR 文件。当需要重建 / 复刻 / 批量处理 CorelDRAW 文档、提取 CDR 的页面·图层·形状·文本结构、把源 CDR 或 PDF/图片参考重建为可编辑 CDR，或校验重建结果与源文件是否一致时使用。Trigger keywords - CorelDRAW, CorelDRAW X8, CDR, 重绘, 复刻, 重建, redraw, rebuild, vector graphics automation, VGCore, pywin32。
+description: 通过 COM 自动化操作 CorelDRAW X8（及更高版本），剖析、精确重绘并校验 CDR 文件。当需要重建 / 复刻 / 批量处理 CorelDRAW 文档、提取 CDR 的页面·图层·形状·文本结构、把源 CDR 或 PDF/图片参考重建为可编辑 CDR，或校验重建结果与源文件是否一致时使用。也适用于把位图参考图（PNG/JPG）描摹成矢量并在 CorelDRAW 中重建。Trigger keywords - CorelDRAW, CorelDRAW X8, CDR, 重绘, 复刻, 重建, 描摹, 矢量化, redraw, rebuild, trace, vectorize, VGCore, pywin32。
 agent_created: true
 ---
 
 # CorelDRAW X8 CDR 重绘
 
-用三种输入模式之一，然后校验产出的 CDR：
+用四种输入模式之一，然后校验产出的 CDR：
 
 1. **源 CDR 模式**：剖析 CDR，生成标准化的文件专属提示词，并精确重建。
 2. **PDF 派生模式**：把 PDF 转成可审计的中间 CDR，再用源 CDR 流程重建并校验。
 3. **图片 + 尺寸模式**：把参考图片与权威尺寸归一化为参数规格，生成矢量几何并校验。
+4. **位图矢量化模式**：把 PNG/JPG 参考图分区描摹为矢量，在 CorelDRAW 中按毫米坐标重建并配准校验。
 
 本技能与 AutoCAD 的 `autocad-dwg-redraw` 技能同构：**剖析 → 生成提示词 → 重建 → 校验**。
 区别在于操作对象是 CorelDRAW 的文档 / 页面 / 图层 / 形状模型，而非 DWG 的 ModelSpace / PaperSpace。
+
+> **位图矢量化请先读 `references/raster-to-vector-notes.md`。**
+> 那份文档记录了 potracer 的 invert 约定、evenodd、`Z M` 分隔符、
+> 上采样对细部保真的影响、X8 的 `ExportEx` 缺陷与配准校验方法，
+> 都是实测踩坑结论，照做可以省掉大量试错。
 
 ## 核心原则
 
@@ -104,6 +110,35 @@ PDF 输入时，除非手上有原始 CDR，否则**不得**声称与源文件�
 - 输出 CDR 路径。
 - 对尺寸未覆盖细节的显式假设与容差。
 
+## 位图矢量化流程
+
+用户给的是位图（PNG/JPG 截图、扫描件、设计稿导出图），要求"照着这张图在 CDR 里画出来"时使用。
+目标是把栅格内容还原成**可编辑的矢量 CDR**，并用配准式像素比对证明还原度。
+
+1. **标定并探测边缘**
+   `mm_per_px = 页面宽度mm / 图片宽度px`。核对图宽高比与页面宽高比是否一致——
+   不一致说明源图裁切过，纵向内容高度会与页面高度产生差异，必须在报告中说明。
+   同时探测四周是否有扫描/裁切残留暗边（如贯穿全高的黑边条），
+   用 `--crop-left` 之类排除，**不要复刻成设计内容**。
+2. **分区**
+   按内容性质切块，每块单独描摹：满版色块用原生矩形、精细线稿、深底反白字标（invert）、小字。
+   可用 `--auto` 按投影快速摸底，正式交付手工给 `--region`。
+3. **调参描摹**
+   先跑 `--probe` 扫参数（关键：**灰度先 LANCZOS 上采样 4× 再二值化**，
+   `alphamax=0.0` 保留硬拐角，`turdsize` 按 U² 折算），挑各区域 IoU 最高的组合，
+   再正式生成 SVG 与 `manifest.json`。
+4. **在 CorelDRAW 中重建**
+   用 `cdr_image_place.py` 建页、建图层、导入 SVG 并按清单尺寸与包围盒精确定位，
+   附加原生矢量矩形，保存 CDR 并导出预览。
+   **导入后必须逐项比对"目标坐标/尺寸 vs 实际坐标/尺寸"，误差应 < 0.02 mm。**
+5. **配准校验**
+   用 `cdr_visual_diff.py` 把渲染图**贴回整页坐标系**后与源图逐像素比对。
+   直接拿内容包围盒导出图与整页源图比是错的（会得到 ~12% 的无意义 IoU）。
+   输出 IoU / 召回 / 精确与差异叠加图；召回低 = 漏画，精确低 = 多画或笔画变粗。
+6. **交付说明**
+   报告 CDR 路径、内容构成、各区域还原度、已知偏差及其来源
+   （哪些是描摹近似、哪些是源图残留未复刻、哪些是小字天然失真）。
+
 ## 重绘提示词标准
 
 每份生成的定制提示词必须包含：
@@ -134,6 +169,9 @@ PDF 输入时，除非手上有原始 CDR，否则**不得**声称与源文件�
 - 不得把 PDF 派生的中间 CDR 说成原始 CDR 的精确副本。
 - 图片 + 尺寸模式中，拒绝非正尺寸、越界构件、无法解释的重叠与不符合总体尺寸的算术合计。
 - 绝不用图片比例替代给定的数值尺寸。
+- 位图矢量化模式中，绝不把描摹结果说成"原始矢量"；明确标注哪些是描摹近似。
+- 源图边缘的扫描/裁切残留不得复刻为设计内容，但必须在交付说明中提及，避免被误判为漏画。
+- 不得声称与源文件"完全一致"；应给出配准指标（IoU / 召回 / 精确）与已知偏差。
 - 保留参数块或参数文件，使文件可用变更后的尺寸重新生成。
 
 ## CorelDRAW 稳定性说明
@@ -150,6 +188,32 @@ PDF 输入时，除非手上有原始 CDR，否则**不得**声称与源文件�
 - 若某版本 `CopyToLayer` 不支持跨文档，回退到文件级复制（`--mode duplicate`）作为保底。
 - 不同版本的形状类型 / 单位枚举数值存在差异：脚本优先从类型库常量取值，
   并始终同时输出原始数值。
+
+### X8 实测补充
+
+- **连接方式**：`GetActiveObject` 在 X8 上常抛
+  `com_error(-2147221021, '操作无法使用')`（MK_E_UNAVAILABLE）。
+  改用 `win32com.client.Dispatch("CorelDRAW.Application.18")`，会复用已打开实例。
+- **可选 VT_DISPATCH 参数会炸**：`doc.SaveAs(p, None)`、`lay.Import(p, 0, None)`、
+  `doc.Export(p, 802, 1, None, None)` —— 末尾必须显式补 `None`，
+  否则抛 `TypeError: The Python instance can not be converted to a COM object`。
+- **`ExportEx` 在 X8 上"返回成功但不写文件"**：以 `Export` 为主，
+  且必须用 `os.path.exists` + 文件大小确认，不能只看有没有抛异常。
+- `page.Shapes.All` 是**方法**：写 `page.Shapes.All().Count`。
+- `Layer.Import` **不返回形状对象**，导入的形状追加到图层末尾：
+  取 `lay.Shapes.Item(lay.Shapes.Count)`，并比对导入前后 `Count` 是否增加。
+- **y 轴向上**，设计稿以左上为原点：
+  `doc.ReferencePoint = 3`（cdrTopLeft）后，`shape.SetPosition(x_mm, page_h - y_top_mm)`。
+- 常量实测值：`cdrMillimeter = 3`（不是 4）、`cdrPortrait = 0`、`cdrTopLeft = 3`、
+  导出滤镜 `cdrPNG = 802`、颜色模式 `cdrRGB = 4`。
+- **`Document.Unit` 不随文件保存**：设成毫米并保存后，重新打开会回到英寸（1）。
+  几何数据本身是绝对单位、不受影响，只是显示/读值单位变了。
+  读坐标前先 `doc.Unit = 3`，否则拿到的是英寸数值。
+- `Application.ActiveDocument` 是**只读属性**，不能赋值；
+  要切换活动文档用 `doc.Activate()`。
+- **`SaveAs` / `Export` 会按 CorelDRAW 自己的工作目录解析相对路径**，
+  必须先把输出路径转成绝对路径，否则文件会落到意外位置。
+- 新建文档自带"图层 1"，直接改名复用，否则会多出一个空图层。
 
 ## 源数据提取
 
@@ -188,6 +252,53 @@ python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cd
 
 用 `scripts/cdr_common.py` 复用连接、重试、遍历与统计逻辑（被上面两个脚本导入）。
 
+### 位图矢量化三件套
+
+`scripts/cdr_image_trace.py` —— 标定 + 分区 + 描摹 + 参数寻优：
+
+```powershell
+# 正式生成：显式给区域（坐标是源图像素，左上原点）
+python scripts\cdr_image_trace.py --image ref.png --page-width 210 --out svg ^
+  --region "art_tools:6,500,1217,900" ^
+  --region "logo_vonder:0,901,1217,1059,invert" ^
+  --region "mark_fragile:876,338,1137,447" ^
+  --region "text_footer:440,1075,870,1106"
+
+# 参数寻优：扫上采样倍数与 potrace 参数，输出各区域 IoU 最优组合
+python scripts\cdr_image_trace.py --image ref.png --page-width 210 --out svg --probe
+
+# 自动分区摸底（正式交付仍建议手工给 --region）
+python scripts\cdr_image_trace.py --image ref.png --page-width 210 --out svg --auto
+```
+
+产出 `{region}.svg` + `manifest.json`（含各区域毫米包围盒、尺寸、参数、IoU）。
+
+`scripts/cdr_image_place.py` —— 按清单在 CorelDRAW 中重建：
+
+```powershell
+python scripts\cdr_image_place.py --manifest svg\manifest.json ^
+  --output out\cover.cdr --preview out\cover_preview.png ^
+  --rect "band:0,155.472,210,27.264,#111111" ^
+  --layer "logo_vonder=LOGO" --white logo_vonder
+```
+
+产出 CDR、预览 PNG 与 `placement.json`（含各元素实际定位误差与内容包围盒）。
+
+`scripts/cdr_visual_diff.py` —— 配准式像素校验：
+
+```powershell
+python scripts\cdr_visual_diff.py --source ref.png ^
+  --render out\cover_preview.png --placement out\placement.json --out compare
+```
+
+产出整页 IoU / 召回 / 精确、分区域指标、差异叠加图与放大对照图。
+
+三个脚本依赖：
+
+```powershell
+python -m pip install numpy opencv-python pillow potracer pywin32
+```
+
 用 `scripts/selftest_offline.py` 在**没有 CorelDRAW 的环境**下做离线冒烟测试，
 验证提示词渲染与校验比对逻辑（用桩模块替代 pywin32）：
 
@@ -205,3 +316,6 @@ python -m pip install pywin32
 
 - `references/prompt-template.md`：定制提示词的完整模板与骨架。
 - `references/coreldraw-object-model.md`：CorelDRAW X8 COM 对象模型、枚举与跨文档复制要点。
+- `references/raster-to-vector-notes.md`：**位图矢量化必读**。potracer 的 invert 约定、
+  evenodd、`Z M` 分隔符、上采样对细部保真的影响、`alphamax=0` 的多边形陷阱、
+  X8 的 `ExportEx` 缺陷、配准校验方法与交付自查清单。

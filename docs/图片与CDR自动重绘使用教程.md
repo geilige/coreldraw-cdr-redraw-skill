@@ -203,7 +203,89 @@ python skills\coreldraw-x8-redraw\scripts\cdr_redraw.py ^
 
 ---
 
-## 六、常见问题
+## 六、位图矢量化模式
+
+### 场景
+
+你只有一张图（截图、扫描件、设计稿导出图），要求"照着这张图在 CDR 里画出来"。
+
+### 怎么提问
+
+```
+使用 coreldraw-x8-redraw 的位图矢量化模式。
+参考图 D:\ref.png，成品尺寸 210×297mm，单位毫米，输出 D:\out\cover.cdr。
+严格参照图纸的布局与细节。
+```
+
+### 三步流程
+
+**① 描摹** —— 先跑参数寻优，再正式生成：
+
+```powershell
+python skills\coreldraw-x8-redraw\scripts\cdr_image_trace.py ^
+  --image ref.png --page-width 210 --out svg --probe
+
+python skills\coreldraw-x8-redraw\scripts\cdr_image_trace.py ^
+  --image ref.png --page-width 210 --out svg ^
+  --region "art_tools:6,500,1217,900" ^
+  --region "logo_vonder:0,901,1217,1059,invert" ^
+  --region "mark_fragile:876,338,1137,447" ^
+  --region "text_footer:440,1075,870,1106"
+```
+
+区域坐标是**源图像素**，左上为原点，格式 `名称:x0,y0,x1,y1[,invert]`。
+`invert` 用于**深底上的白字/白图**。
+
+**② 重建** —— 按清单在 CorelDRAW 里建页、建图层、导入定位：
+
+```powershell
+python skills\coreldraw-x8-redraw\scripts\cdr_image_place.py ^
+  --manifest svg\manifest.json ^
+  --output out\cover.cdr --preview out\cover_preview.png ^
+  --rect "band:0,155.472,210,27.264,#111111" ^
+  --layer "logo_vonder=LOGO" --white logo_vonder
+```
+
+`--rect` 用来画满版色块（色带、底块）——这类元素**不要描摹**，直接用原生矢量矩形，
+又准又小。`--white` 指定哪些区域要填白（深底上的反白元素）。
+
+**③ 校验** —— 配准式像素比对：
+
+```powershell
+python skills\coreldraw-x8-redraw\scripts\cdr_visual_diff.py ^
+  --source ref.png --render out\cover_preview.png ^
+  --placement out\placement.json --out compare
+```
+
+输出整页与分区域的 IoU / 召回 / 精确，以及差异叠加图（深灰=一致、
+红=漏画、蓝=多画）和放大对照图。
+
+### 还原度预期
+
+| 元素类型 | 典型 IoU |
+| --- | --- |
+| 满版色块（原生矩形） | ≈ 98% |
+| 反白大字号字标 | ≈ 98% |
+| 精细线稿插图 | 84–88% |
+| 6pt 级小字 | ≈ 68%（天然短板） |
+
+**达不到 100% 是正常的**——描摹必然在边缘产生 1px 级偏差。
+重点是看指标偏低的是"漏画"（召回低）还是"多画/变粗"（精确低）。
+
+### 关键注意
+
+- **标定**：`mm_per_px = 页面宽度mm / 图片宽度px`。若图宽高比与页面宽高比不一致，
+  说明源图裁切过，纵向内容会与页面高度有偏差，交付说明里会写清楚。
+- **源图边缘残留**：扫描/裁切留下的贯穿全高黑边条**不会**被复刻为设计内容，
+  但会在报告里标注，避免被误判为漏画。
+- **小字号文字**描摹后是轮廓而非活字。需要可编辑文本的话要确认字体后重建——
+  字体猜错比描摹失真更严重。
+- 详细的踩坑记录见
+  [`references/raster-to-vector-notes.md`](../skills/coreldraw-x8-redraw/references/raster-to-vector-notes.md)。
+
+---
+
+## 七、常见问题
 
 ### Q1：报 `Invalid class string`
 
@@ -242,9 +324,62 @@ CorelDRAW 忙。脚本会自动重试。若持续失败，关掉多余的 CorelD
 
 所以看到 `[6]` 这类方括号里的数字时，以它为准。
 
+### Q8：重新打开 CDR 后，坐标数值大了一截（比如 210 变成 8.27）
+
+`Document.Unit` **不随文件保存**。设成毫米并保存后，重新打开会回到英寸（1）。
+几何数据本身是绝对单位、完全没受影响，只是读值单位变了。
+
+读坐标前先设置一次：
+
+```python
+doc.Unit = 3      # cdrMillimeter
+```
+
+### Q9：`SaveAs` 没报错，但文件不在指定位置
+
+`SaveAs` / `Export` 会按 **CorelDRAW 自己的工作目录**解析相对路径。
+调用前把路径转成绝对路径：
+
+```python
+doc.SaveAs(os.path.abspath(out_path), None)
+```
+
+技能自带的脚本已做此处理；自己写代码时要注意。
+
+### Q10：描摹出来的图形边缘是折线，圆角变成了斜切
+
+`alphamax=0` 会让 potrace 输出**纯多边形**（不做任何平滑）。
+注意它的像素 IoU 反而可能最高，只看 IoU 会选出最差的结果。
+
+判断方法：数一下 SVG 里的曲线段与直线段：
+
+```python
+print(svg.count("C"), svg.count("L"))   # 曲线段为 0 就是多边形
+```
+
+调高 `--alphamax`（0.5~1.0）。
+
+### Q11：小图标（箭头、酒杯之类）描摹后变形
+
+细笔画在原图上只有 1–2 px，直接描摹必然失真。
+**解法是描摹前先把灰度上采样 4 倍再二值化**（`--upscale 4`），
+不是调 alphamax。实测能把这类图标从"明显失真"救回"形状正确"。
+
+### Q12：位图矢量化后比对 IoU 只有十几个百分点
+
+多半是把**内容包围盒**的导出图直接和**整页**源图比了。
+导出图通常是内容区（例如 210×130mm），不是整页 A4。
+必须按 `placement.json` 记录的内容包围盒把渲染图贴回整页白底再比——
+`cdr_visual_diff.py` 已自动处理。
+
+### Q13：源图边缘有一条黑边，需要画进 CDR 吗
+
+那是扫描/裁切残留，**不要复刻**。`cdr_image_trace.py` 会自动探测并提示，
+用 `--crop-left N` 排除即可。但要在交付说明里提一句，避免被误认为漏画。
+
 ---
 
-## 七、脚本参数速查
+## 八、脚本参数速查
 
 ### cdr_prompt_builder.py
 
@@ -269,9 +404,51 @@ CorelDRAW 忙。脚本会自动重试。若持续失败，关掉多余的 CorelD
 
 > 输出路径已存在时，脚本会自动追加时间戳，**绝不覆盖**已有文件。
 
+### cdr_image_trace.py
+
+| 参数 | 说明 |
+| --- | --- |
+| `--image` | 必填，参考图路径（PNG/JPG） |
+| `--page-width` | 必填，页面宽度（毫米），用于标定 mm/px |
+| `--page-height` | 页面高度（毫米）；省略则按图比例推导 |
+| `--region` | 区域定义 `名称:x0,y0,x1,y1[,invert]`，可重复；坐标是源图像素 |
+| `--auto` | 自动按投影分割区域 |
+| `--out` | 输出目录，默认 `svg` |
+| `--upscale` | 描摹前灰度上采样倍数，默认 4（**细部保真的关键**） |
+| `--turdsize` | 斑点面积阈值（源图像素），默认 3；内部按 `upscale²` 折算 |
+| `--alphamax` | 拐角阈值，默认 0.5；**0 = 纯多边形，不要用** |
+| `--opttolerance` | 曲线优化容差，默认 0.1 |
+| `--probe` | 参数扫描模式，只输出候选参数 IoU，不写 SVG |
+| `--crop-left` | 忽略源图最左侧 N 列（裁切/扫描残留） |
+
+### cdr_image_place.py
+
+| 参数 | 说明 |
+| --- | --- |
+| `--manifest` | 必填，`cdr_image_trace.py` 产出的 `manifest.json` |
+| `--output` | 必填，输出 CDR 路径 |
+| `--preview` | 预览 PNG 路径；省略则不导出 |
+| `--progid` | CorelDRAW ProgID，默认 `CorelDRAW.Application.18` |
+| `--rect` | 附加原生矢量矩形 `名称:x,y,w,h,#RRGGBB`，可重复（y 为距页顶毫米） |
+| `--layer` | 图层映射 `区域名=图层名`，可重复 |
+| `--white` | 需要填白的区域名（深底上的反白元素），可重复 |
+| `--layer-order` | 图层自下而上的顺序，逗号分隔 |
+| `--close-existing` | 构建前关闭名称以这些前缀开头的文档，逗号分隔 |
+
+### cdr_visual_diff.py
+
+| 参数 | 说明 |
+| --- | --- |
+| `--source` | 必填，源参考图路径 |
+| `--render` | 必填，CDR 导出的预览图路径 |
+| `--placement` | 必填，`cdr_image_place.py` 产出的 `placement.json` |
+| `--out` | 输出目录，默认 `compare` |
+| `--width` | 比对用整页位图宽度，默认 2480（约 300dpi A4） |
+| `--threshold` | 二值化阈值，默认 128 |
+
 ---
 
-## 八、退出码
+## 九、退出码
 
 | 退出码 | 含义 |
 | --- | --- |
