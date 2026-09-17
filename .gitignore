@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 输出产物（不提交用户的源文件与导出结果）
+outputs/
+reports/
+*.cdr
+*.CDR
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.svg
+*.eps
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 例外：允许文档配图
+!docs/**/*.png
+!docs/**/*.jpg
+!docs/**/*.jpeg
+!docs/**/*.gif
+
+# 临时文件
+*.tmp
+*.log
