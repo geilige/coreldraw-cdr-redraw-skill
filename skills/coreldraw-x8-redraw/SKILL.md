@@ -537,6 +537,15 @@ Windows 上 `onnxruntime` 还缺 `vcruntime140_1.dll` 与 `msvcp140_1.dll`
 （前者 Python 安装目录自带），缺了会报 `DLL load failed`。
 用 `pefile` 查 `.pyd` 的导入表能直接看出缺哪个。详见 `references/live-text-design.md`。
 
+> **⚠️ 依赖装到哪个解释器，就必须用哪个解释器跑脚本。**
+> 上面几条 `pip install` 装进的是**当前** `python` 所属的环境。若机器上有多个
+> Python（隔离环境、conda、系统 Python 并存），用另一个解释器跑脚本会直接
+> `ModuleNotFoundError: No module named 'numpy'` —— 而这个报错看起来像"没装依赖"，
+> 很容易被误判成安装失败、白折腾一轮。
+> 排查口径：报错时先 `python -c "import sys; print(sys.executable)"` 确认是哪个解释器，
+> 再确认依赖装在了哪个。**跑脚本时始终用装了依赖的那个绝对路径**，
+> 不要依赖 `PATH` 里的 `python`。
+
 `selftest_offline.py` 覆盖三块：纯逻辑（提示词渲染、CDR 结构比对）；
 **用一张几何已知的合成图**验证自动分区的每一处坑（残留剥离、外沿外扩、
 满版色带贯通判据、行中位数、列方向切分、超采样度量的偏差量级）；
