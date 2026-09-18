@@ -683,7 +683,7 @@ python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cd
 ```text
 python -m pip install numpy opencv-python pillow potracer
 python -m pip install pywin32          # 只有要建 CDR 时才需要
-python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线回归测试（196 项断言）
+python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线回归测试（204 项断言）
 ```
 
 文字转活字另需 OCR（离线，无需联网）：
@@ -719,7 +719,9 @@ OCR 的预处理与变体选择（Otsu 平台期、二值化极性、变体选�
 **字形级纠错与字体相似度**（灰度/布尔切段必须一致、逐词对齐不受整行相位影响、
 字高判据正反两向 + 五条安全约束 + 传字符串必须抛错）；
 **整图识别**（调色板按方向聚类不被抗锯齿拆成假色、按色分离不串色、
-块包围盒是紧框、文字朝向判定、OCR 框吸附相连笔画但不吞相邻元素）。
+块包围盒是紧框、文字朝向判定、OCR 框吸附相连笔画但不吞相邻元素）；
+**编排脚本的区域清单解析**（活字清单 y 在前、颜色与 rot 组合、
+3 位坐标不被误判成色值、无法识别的字段必须抛错）。
 **夹具全部用实测值而不是编的数**——包括那张"置信度会选错"的变体表。
 
 改动 `auto_partition` / `strip_residue` / `_tighten` / `rasterize` /
