@@ -353,6 +353,172 @@ def classify_symbol(sub, xheight):
     return None
 
 
+# 大小写**只有高度一个区别**的字母（上下同形）。
+# 只有这些字母才适合用字高判大小写：形状本来就不同的（a/A、e/E、g/G…）
+# OCR 基本不会错，而字高也不是它们的判据。
+HEIGHT_ONLY_CASE = 'cosvwxz'
+
+
+def _as_mask(sub):
+    """把灰度裁切或布尔掩膜统一成布尔掩膜（True = 墨迹）。
+
+    **为什么必须显式归一化**（真踩过）：`ndarray.any(axis=0)` 对布尔数组是
+    "这一列有没有墨"，对 uint8 灰度数组却是"这一列有没有**非零值**"——
+    背景灰度约 240，全部非零，于是整词被判成**一个**列段。不报错、不抛异常，
+    只是静默地把"逐字切分"退化成"整词一块"，后续字高判据全部失效
+    （实测：`O.v.D.` 的 5 个列段被读成 1 个，高 16 = 整幅裁切高度）。
+    这里统一按管线口径 `< 128` 取墨迹，与 `propose_fixes` 内的用法一致。
+    """
+    a = np.asarray(sub)
+    return a if a.dtype == bool else (a < 128)
+
+
+def _col_runs(sub):
+    """把一段掩膜按"空列"切成若干列段，每个列段对应一个字形。
+
+    接受布尔掩膜或灰度裁切（见 `_as_mask`）。
+    """
+    runs, s = [], None
+    cols = _as_mask(sub).any(axis=0)
+    for i, v in enumerate(cols):
+        if v and s is None:
+            s = i
+        elif not v and s is not None:
+            runs.append((s, i))
+            s = None
+    if s is not None:
+        runs.append((s, len(cols)))
+    return runs
+
+
+def _glyph_h(sub, a, b):
+    """列段 `[a, b)` 内墨迹的竖直跨度（像素）。接受布尔掩膜或灰度裁切。"""
+    ys = np.where(_as_mask(sub)[:, a:b].any(axis=1))[0]
+    return int(ys.max() - ys.min() + 1) if len(ys) else 0
+
+
+def case_by_height(core, words, toks, min_gap=1.0, min_anchor_gap=2.0):
+    """用**行内字高**判"上下同形"字母的大小写。返回与 `propose_fixes` 同格式的建议。
+
+    **为什么必须补这一条**（真踩过）：源图页脚是 `O.V.D. ...`，OCR 交出来的是
+    `O.v.D. ...`，而且——**所有 6 个二值化变体都读成小写 v**，只有 2 个灰度变体
+    读对。所以：
+      * **多数投票救不了**（6 : 2，多数是错的）；
+      * **置信度救不了**（错的对的都在 0.906~0.921）；
+      * `propose_fixes` 现有的打分**还会反向选**：它按"左对齐 + 自然宽度"比，
+        而大写 V 更宽、整词右移错位，`O.V.D.` 只拿到 0.1432，反而低于
+        `O.v.D.` 的 0.2280 —— 这个分被**累积宽度漂移**主导，不是被那个字的形状主导。
+    根因是二值化削掉了 V 顶端的细笔画，V 看起来就像 v。
+
+    **判据只用几何、与字体无关**：在**同一行内**比较
+      * `x-height`  ← "无升降部小写字母"（a c e m n o r s u v w x z）高度的中位数
+      * `cap-height`← 大写字母高度的中位数
+    再把待判字母的高度 `h` 归到更近的一边。实测那条页脚：x-height 9px、
+    cap-height 12~13px，待判的 V 高 12px → 离 cap 0.5px、离 x 2.5px，明确是大写。
+
+    **⚠️ 必须是"行内相对"，不能用绝对阈值。** 早先用过一个绝对字高阈值，
+    把 `Importadora` 的 m/r/a/e/s 全判成大写（16px 字里 x-height 与 cap 只差
+    3px），IoU 从 0.606 掉到 0.36。行内相对比较天然规避这个问题：
+    那些字母的高度就等于本行的 x-height，怎么比都是小写。
+
+    **怎么把列段对到字母上**（这一步不做对，后面全是空谈）：
+    先按"空列"切出列段，再**滤掉小碎块**——句点、连字符这类记号高度远小于
+    主体（实测句点高 2px、连字符 4px，而字母 9~13px），它们不参与大小写判断。
+    剩下的列段数若等于词里字母数，就能按顺序一一对上。
+    实测那条页脚九个词**全部对得上**：`O.v.D.`→3 段(O,v,D)、`Importadora`→11、
+    `Distribuidora`→13、`Curitiba`→8、`PR`→2。
+    **注意不能要求"列段数 == 字符数"**：`O.V.D.` 里 V 与 D 之间那个句点在
+    二值图上墨迹为 0（太淡），列段只有 5 个而字符有 6 个——按字符数要求会直接
+    把这个词跳过，等于白写。**按字母数要求才对。**
+
+    **⚠️ 判据只能用高度，不能用宽度。** 那个几乎看不见的句点会在二值图上
+    留下几个**杂散像素**（实测落在 V 右边 x21~23），被并进 V 的列段里，
+    于是 V 的"列段宽度"量出来是 10px，而它真正的笔画只有 8px（x13~20）——
+    正好等于该字体大写 V 的宽度。宽度会被相邻的弱墨迹污染，高度不会
+    （杂散像素只有 1~2 行高，落在基线附近，抬不动 cap-height 那一端的跨度）。
+
+    **安全约束（宁可漏判，不可错判）**：
+      * 列段与字母对不上号的词直接跳过；
+      * 只处理 `HEIGHT_ONLY_CASE` 里的字母；
+      * 两组锚点各至少 2 个样本，且 cap−x 的差至少 `min_anchor_gap`，
+        否则说明这一行本身区分度不够，整体放弃；
+      * 高度差要超过 `min_gap` 才动，避免把测量噪声当证据；
+      * x 锚点**排除** `HEIGHT_ONLY_CASE` 里的字母——它们正是待判对象，
+        混进去会自己抬高 x-height、把判据泡软。
+    """
+    if isinstance(toks, str):
+        # **不要**在这里"顺手 split 一下"把调用方的错掩盖掉：整串文本的
+        # `len()` 是字符数，恰好会走进下面"词数不一致 → 放弃"的守卫，
+        # 于是整条修复静默失效、日志上什么也看不出来。实测就这么漏过一次。
+        raise TypeError(
+            'toks 必须是词列表，收到字符串（%d 个字符）。传整串文本会让 '
+            'len() 变成字符数、命中"词数不一致"守卫并静默返回空建议。'
+            % len(toks))
+    if len(words) != len(toks):
+        return [], []
+
+    # 先切列段并量高度；小碎块的判据用"全行最高列段"的 35%，
+    # 这样不必先知道 x-height（避免鸡生蛋）
+    raw = []
+    for tok, (wx0, wx1) in zip(toks, words):
+        sub = core[:, max(wx0, 0):max(wx1, 1)]
+        runs = _col_runs(sub)
+        hs = [_glyph_h(sub, a, b) for a, b in runs]
+        raw.append((sub, runs, hs))
+    hmax = max((h for _, _, hs in raw for h in hs), default=0)
+    if hmax <= 0:
+        return [], []
+    mark_cut = 0.35 * hmax
+
+    per_word = []
+    x_samples, cap_samples = [], []
+    for tok, (sub, runs, hs) in zip(toks, raw):
+        letters = [(a, b, h) for (a, b), h in zip(runs, hs) if h > mark_cut]
+        n_letter = sum(1 for c in tok if c.isalpha())
+        if not letters or len(letters) != n_letter:
+            per_word.append(None)
+            continue
+        per_word.append((letters, [c for c in tok if c.isalpha()]))
+        for (a, b, h), ch in zip(letters, [c for c in tok if c.isalpha()]):
+            if ch.isupper():
+                cap_samples.append(h)
+            elif ch.lower() in 'acemnorsuvwxz' and ch.lower() not in HEIGHT_ONLY_CASE:
+                x_samples.append(h)
+
+    if len(x_samples) < 2 or len(cap_samples) < 2:
+        return [], []
+    x_h = float(np.median(x_samples))
+    cap_h = float(np.median(cap_samples))
+    if cap_h - x_h < min_anchor_gap:
+        return [], []          # 这一行 x-height 与 cap 太接近，分不出来，放弃
+
+    proposals, notes = [], []
+    for idx, pw in enumerate(per_word):
+        if pw is None:
+            continue
+        letters, alpha = pw
+        chars = list(toks[idx])
+        # 把字母按顺序对回原 token 的下标
+        pos = [i for i, c in enumerate(chars) if c.isalpha()]
+        for (a, b, h), ch, ci in zip(letters, alpha, pos):
+            low = ch.lower()
+            if low not in HEIGHT_ONLY_CASE or h <= 0:
+                continue
+            d_x = abs(h - x_h)
+            d_c = abs(h - cap_h)
+            want = None
+            if d_c + min_gap < d_x:
+                want = ch.upper()
+            elif d_x + min_gap < d_c:
+                want = ch.lower()
+            if want and want != ch:
+                new = ''.join(chars[:ci] + [want] + chars[ci + 1:])
+                proposals.append((idx, new, 'case-height'))
+                notes.append('%s->%s(高%d: x%.0f/cap%.0f)'
+                             % (ch, want, h, x_h, cap_h))
+    return proposals, notes
+
+
 def propose_fixes(core, words, text, font_file, margin=0.08):
     """逐词提出修改**建议**（不直接采纳），交给调用方用整体 IoU 逐个裁决。
 
@@ -366,9 +532,18 @@ def propose_fixes(core, words, text, font_file, margin=0.08):
 
     两个必须注意的点：
       * **不要先把候选横向拉伸到与源同宽再比**。那样会把字宽差异抹掉，
-        'O.V.D.' 与 'O.v.D.' 就分不出来了。正确做法是只按高度缩放，
-        然后铺到"两者较宽"的画布上比，宽度不合自然会被 IoU 罚掉。
+        于是分不出"字距不对"和"字形不对"。
+        （**但这条理由不能推到"分不出大小写"**：实测 `O.V.D.` vs `O.v.D.`
+        拉伸到同宽后 IoU 仍有 0.7476 : 0.7103 的可分差距——因为横向拉伸
+        不改变**高度**，而大写 V 与小写 v 的区别正在高度上。
+        这里旧注释曾写成"就分不出来了"，是错的，已按实测改正。）
       * 单字符词不用渲染比，直接用 classify_symbol 量字形（与字体无关）。
+
+    **⚠️ 本函数的打分有个已知弱点**：它按"左对齐 + 自然宽度"比，
+    所以**整词的累积宽度漂移会盖过单个字的形状差异**。实测 `O.v.D.`
+    得 0.2280 而正确的 `O.V.D.` 只有 0.1432（大写 V 更宽 → 后面全错位），
+    **这个分是反向的**。所以"上下同形字母的大小写"不要指望这里，
+    交给 `case_by_height` 用行内字高判——那是几何证据，与字体无关。
     """
     toks = [t for t in text.split(' ') if t]
     if len(toks) != len(words):
@@ -483,14 +658,69 @@ def _iou(a, b):
     return (int((a & b).sum()) / u) if u else 0.0
 
 
+def _tight_mask(m):
+    """紧裁到墨迹包围盒；全空返回 None。"""
+    ys = np.where(m.any(axis=1))[0]
+    xs = np.where(m.any(axis=0))[0]
+    if not len(ys) or not len(xs):
+        return None
+    return m[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+
+
+def _word_aligned_iou(src_mask, rend_mask):
+    """按列投影切词、**逐词紧裁后**再比的 IoU。切不齐返回 None。
+
+    为什么不拿整行 IoU 排字体（真踩过，代价是选错字体）：
+    把渲染结果横向拉伸到源宽度时，每个字形的横向位置误差是**累积**的，
+    行末能到几像素；而小字号下笔画只有 1~2px 宽，于是整行 IoU 基本由
+    "拉伸相位"决定，而不是由字形决定。实测**同一个字体**只改一个字母的
+    大小写（源图真值是大写 V）：
+        文本        整行 IoU    逐词对齐 IoU
+        'O.v.D. …'  0.7244  ← 错的文本反而高   0.7056
+        'O.V.D. …'  0.5090  ← 对的文本反而低   0.7235
+    整行口径**把方向搞反了**，并据此把最佳字体从 `Swis721 Cn BT / Bold`
+    选成了 `Swis721 BlkCn BT / Black`（笔画明显更重）。
+    逐词对齐后方向与真值一致，也与独立证据"墨迹密度"一致：
+    源 0.2852、Cn BT/Bold 0.3106、BlkCn BT/Black 0.3563。
+
+    **对齐能纠回方向，但不能当成"字形级判别器"用**：单字形的大小写差异
+    仍在噪声底附近（0.7235 vs 0.7056，差 0.018）。真正定案靠的是
+    直接量字形——源图那个字高 12px（= cap-height，x-height 只有 9px）、
+    宽 8px（= 该字体大写 V 的宽度，小写 v 只有 6~7px）。见 `case_by_height`。
+
+    代价与边界：逐词拉伸抹掉了词内字距差异，所以**词间宽度差必须继续由
+    `width_ratio` 单独把关**（它算的是整行自然宽度比，不经拉伸）。
+    词数切不一致时返回 None，调用方回退到整行 IoU。
+    """
+    sw_runs, _ = gap_split(src_mask)
+    rw_runs, _ = gap_split(rend_mask)
+    if not sw_runs or len(sw_runs) != len(rw_runs):
+        return None
+    inter = uni = 0
+    for (a0, a1), (b0, b1) in zip(sw_runs, rw_runs):
+        A = _tight_mask(src_mask[:, a0:a1])
+        B = _tight_mask(rend_mask[:, b0:b1])
+        if A is None or B is None:
+            continue
+        B = resize_mask(B, A.shape[1], A.shape[0])
+        inter += int((A & B).sum())
+        uni += int((A | B).sum())
+    return (inter / uni) if uni else None
+
+
 def match_fonts(src_mask, text, corel_fonts=None, top=12):
     """把候选字体渲染同一串文本，按高度归一后比 IoU。
 
     两个指标分开看：
-      iou   —— 把渲染结果横向拉伸到与源同宽后的 IoU（纯字形形状）
+      iou   —— **逐词对齐**后的 IoU（纯字形形状；切不齐时回退整行 IoU）
       wr    —— 渲染宽度 / 源宽度（字距与字宽的宏观差异）
     只看 iou 会把"字形像但字距差很多"的字体排上来；只看 wr 又分不清
     谁的字形更像。综合分 = iou*0.7 + max(0,1-|wr-1|)*0.3。
+
+    **为什么 iou 用逐词对齐而不是整行**：小字号下笔画只有 1~2px 宽，
+    整行 IoU 会被"横向拉伸的相位"主导——实测只改一个字母大小写就能让
+    同一字体的整行 IoU 从 0.7244 掉到 0.5090，并且把最佳字体选错。
+    详见 `_word_aligned_iou`。`iou_line` 字段保留整行值以便对照。
     """
     sh, sw = src_mask.shape
     rows = []
@@ -505,9 +735,13 @@ def match_fonts(src_mask, text, corel_fonts=None, top=12):
         fam, sty = family_of(p)
         if corel_fonts and fam not in corel_fonts:
             continue
+        iou_line = _iou(src_mask, m3)
+        iou_al = _word_aligned_iou(src_mask, m3)
         rows.append({
             'family': fam, 'style': sty, 'file': os.path.basename(p),
-            'iou': round(_iou(src_mask, m3), 4),
+            'iou': round(iou_al if iou_al is not None else iou_line, 4),
+            'iou_line': round(iou_line, 4),
+            'iou_aligned': (round(iou_al, 4) if iou_al is not None else None),
             'width_ratio': round(wr, 3),
             'rendered_w_px': int(m2.shape[1]),
         })
@@ -632,12 +866,21 @@ def decide_convert(final_iou, lift, width_ratio, n_cc, n_char,
       D. lift >= min_lift 且 final_iou >= min_iou_floor
 
     **为什么 A、B 可以用绝对区间，而相似度不能**：
-      IoU 的可达上限随字号退化——实测 16px 高的页脚，即使用完全正确的字体
-      与完全正确的文本，IoU 也只有 0.61；用 0.62 的绝对门槛会把完美匹配也
-      拒掉。所以相似度只能比"相对候选集中位的提升倍数"。而 A 与 B 都是
-      **与字号无关的比值**：A 的期望值恒为 1（一个字形一个分量），
-      B 的期望值也恒为 1（字体的自然字宽就是源宽度），所以绝对区间不仅
-      合理，而且是唯一稳的判据。
+      IoU 的可达上限随字号退化——小字号下笔画只有 1~2px 宽，栅格化与
+      横向拉伸的相位误差就能吃掉一大截。实测 16px 高的页脚，用最佳字体
+      配完全正确的文本也只有 **0.7235**（`min_iou` 因此定在 0.72，
+      而不是常见的 0.8+）。所以相似度主要看"相对候选集中位的提升倍数"，
+      绝对门槛只当兜底。而 A 与 B 都是**与字号无关的比值**：
+      A 的期望值恒为 1（一个字形一个分量），B 的期望值也恒为 1
+      （字体的自然字宽就是源宽度），所以绝对区间不仅合理，而且是唯一稳的判据。
+
+      ⚠️ **换度量必须连门槛一起重校。** 实测把 `iou` 从"整行"换成
+      "逐词对齐"（见 `_word_aligned_iou`）后，同一页脚的
+      `final_iou` 0.7244→0.7235（几乎没动），但 `lift` 2.675→**1.68**
+      ——因为中位候选的 IoU 也一起抬高了。若只改度量不改门槛，
+      一个本该 convert 的页脚会被"相似度不足"拒掉（真踩过）。
+      同时 `rebuild_iou` 必须与 `match_fonts` 同源，否则
+      `final_iou` 与 `median_iou` 来自两套度量，`lift` 算出来是废数。
 
     **为什么 A、B 必须是硬门槛（不能像 C/D 那样"满足其一"）**：
       它们是"这块东西是不是文字"的前提。前提不成立时，C、D 算出来的高分
@@ -1246,6 +1489,15 @@ def main(argv=None):
                     return _iou(core, resize_mask(m2, tw, th))
 
                 props, notes = propose_fixes(core, words, text, fpath)
+                # 注意第三个参数是**词列表**，不是整串文本。曾经传成 `text`，
+                # `len('O.v.D. …')`=60 对上 `len(words)`=9 → 守卫判定"词数不一致"
+                # → 静默返回空建议，整条修复等于没接线（见函数内的类型检查）。
+                hprops, hnotes = case_by_height(core, words, toks)
+                # 同一个词被两个来源都提了建议时保留"几何"那条：
+                # 它不依赖字体、也不依赖 OCR 的置信度，证据更硬。
+                claimed = {i for i, _, _ in hprops}
+                props = [p for p in props if p[0] not in claimed] + hprops
+                notes = notes + hnotes
                 if notes:
                     print('  形状修正建议: %s' % '; '.join(notes[:10]))
                 # 逐条试：**每次只加一个改动，整体 IoU 变好才留下**。
@@ -1260,8 +1512,10 @@ def main(argv=None):
                     trial = list(tk)
                     trial[idx] = newtok
                     trial_text = ' '.join(trial)
-                    if kind == 'symbol':
-                        # 字形量出来的符号：证据无歧义，直接采纳
+                    if kind in ('symbol', 'case-height'):
+                        # 字形/字高量出来的：证据无歧义、与字体无关，**直接采纳**。
+                        # 单个字符只占整行约 1% 面积，全局 IoU 根本分不出来
+                        # （`•` 是这样，`v`/`V` 也是这样）。
                         applied.append({'word': tk[idx], 'to': newtok,
                                         'kind': kind, 'adopted': 'geometry'})
                         cur = trial_text
@@ -1303,12 +1557,21 @@ def main(argv=None):
             continue
 
         def rebuild_iou(txt, cand):
+            """重建复核：用最终文本 + 最佳字体重渲染，再算一次相似度。
+
+            **必须与 `match_fonts` 用同一个口径**（逐词对齐，切不齐才回退整行）。
+            踩过一次：排名已经改成词级对齐、这里却还留着整行 IoU，于是
+            `final_iou` 与 `fstats['median_iou']` 来自两套度量，lift 被算成
+            1.18（真实是 1.68），一个本来该判 convert 的页脚被"相似度不足"拒掉。
+            同一批数字必须同源。
+            """
             m = render_mask(txt, os.path.join(FONT_DIRS[0], cand['file']))
             if m is None:
                 return 0.0, None
             m2 = resize_mask(m, m.shape[1] * (th / m.shape[0]), th)
             m3 = resize_mask(m2, tw, th)
-            return round(_iou(core, m3), 4), m3
+            al = _word_aligned_iou(core, m3)
+            return round(al if al is not None else _iou(core, m3), 4), m3
 
         best = cands[0]
         final_iou, mask = rebuild_iou(final_text, best)

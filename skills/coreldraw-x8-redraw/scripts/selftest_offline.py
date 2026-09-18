@@ -513,13 +513,17 @@ def test_glyph_stats():
 def test_decide_convert():
     """四条判据。夹具是**实测值**，不是编的数：
 
-        页脚（真文字，应转）  n_cc=53  n_char=48  wr=0.987  iou=0.7244  lift=2.675
-        插图（非文字，应拒）  n_cc=66  n_char=6   wr=1.887  iou=0.3859  lift=1.531
+        页脚（真文字，应转）  n_cc=53  n_char=48  wr=0.992  iou=0.7235  lift=1.68
+        插图（非文字，应拒）  n_cc=66  n_char=6   wr=1.887  iou=0.3859  lift=1.53
 
     第二行就是修复前的真 bug：C 判据没过，但 D 判据（lift 1.531 > 1.25 且
     iou 0.3859 > 0.35）全过，于是在 CDR 里建了一行 'wander'。
+
+    （页脚那行是 IoU 口径改成"逐词对齐"之后重测的：0.7244/2.675 → 0.7235/1.68。
+    绝对值几乎没动，但 lift 掉了一半——因为中位候选的 IoU 也一起抬高了，
+    相对优势本就比整行口径下小。这正是"换度量必须连门槛一起重校"的原因。）
     """
-    FOOTER = dict(final_iou=0.7244, lift=2.675, width_ratio=0.987,
+    FOOTER = dict(final_iou=0.7235, lift=1.68, width_ratio=0.992,
                   n_cc=53, n_char=48)
     ART = dict(final_iou=0.3859, lift=1.531, width_ratio=1.887,
                n_cc=66, n_char=6)
@@ -715,6 +719,195 @@ def test_stat_sig(tmpdir):
 
 
 # ---------------------------------------------------------------------------
+# F. 字形级纠错与字体相似度（纯逻辑 + 合成图）
+# ---------------------------------------------------------------------------
+
+
+def test_as_mask():
+    """`_col_runs` / `_glyph_h` 必须同时吃布尔掩膜和灰度裁切。
+
+    真踩过：这两个函数是按布尔掩膜写的，`ndarray.any(axis=0)` 对布尔数组是
+    "这一列有没有墨"，对 uint8 灰度数组却是"这一列有没有**非零值**"——
+    背景灰度约 240 全部非零，于是整个词被判成**一个**列段。
+    不报错、不抛异常，只是把"逐字切分"静默退化成"整词一块"，
+    后续所有字高判据一起失效（实测 `O.v.D.` 的 5 个列段被读成 1 个、
+    高 16 = 整幅裁切高度）。
+    """
+    gray = np.full((16, 30), 240, np.uint8)
+    gray[4:16, 0:6] = 0
+    gray[4:16, 10:16] = 0
+    ink = gray < 128
+
+    check("布尔掩膜切出 2 个列段", L._col_runs(ink) == [(0, 6), (10, 16)],
+          str(L._col_runs(ink)))
+    check("**灰度裁切**也切出 2 个列段（归一化生效）",
+          L._col_runs(gray) == [(0, 6), (10, 16)], str(L._col_runs(gray)))
+    check("灰度裁切下字高正确（12，不是整幅的 16）",
+          L._glyph_h(gray, 0, 6) == 12, str(L._glyph_h(gray, 0, 6)))
+    check("_as_mask 对布尔输入不复制、原样返回",
+          L._as_mask(ink) is ink)
+    check("_as_mask 对灰度输入按管线口径 <128 取墨",
+          L._as_mask(gray)[0, 0] is np.False_ or L._as_mask(gray)[0, 0] == False)
+
+
+def test_word_aligned_iou():
+    """字体相似度必须**逐词对齐**，不能被整行拉伸的相位主导。
+
+    真踩过：整行 IoU 把渲染结果横向拉伸到源宽度，字形位置误差是累积的；
+    小字号下笔画只有 1~2px 宽，于是这个分基本由"拉伸相位"决定。
+    实测同一个字体只改一个字母大小写：
+        'O.v.D. …' 整行 0.7244（错的文本反而高）  'O.V.D. …' 整行 0.5090
+    直接导致最佳字体从 `Swis721 Cn BT/Bold` 被选成 `Swis721 BlkCn BT/Black`。
+    """
+    H, BW = 12, 3          # 画布高 / 竖条宽
+    WSTARTS = (0, 30, 60)  # 三个词的起点（词宽 19、词内间隙 5、词间间隙 11）
+    IN_GAP = 5             # 词内竖条间距
+
+    def line(word_shifts):
+        """每个词整体平移 word_shifts[i] 像素后画出来。"""
+        m = np.zeros((H, 90), bool)
+        for ws, sh in zip(WSTARTS, word_shifts):
+            for k in range(3):
+                x = ws + sh + k * (BW + IN_GAP)
+                m[2:H, x:x + BW] = True
+        return m
+
+    src = line((0, 0, 0))
+    # 累积漂移：三个词分别右移 0 / 2 / 4 像素（模拟拉伸造成的行内错位）
+    rend = line((0, 2, 4))
+
+    W = max(src.shape[1], rend.shape[1])
+    a = np.zeros((H, W), bool); a[:, :src.shape[1]] = src
+    b = np.zeros((H, W), bool); b[:, :rend.shape[1]] = rend
+    line_iou = L._iou(a, b)
+    al = L._word_aligned_iou(src, rend)
+
+    check("源切出 3 个词", len(L.gap_split(src)[0]) == 3,
+          str(L.gap_split(src)[0]))
+    check("渲染切出 3 个词", len(L.gap_split(rend)[0]) == 3,
+          str(L.gap_split(rend)[0]))
+    check("逐词对齐 IoU = 1.0（词内完全一致，只是整体平移）",
+          al is not None and near(al, 1.0, 0.02), str(al))
+    check("同一对图整行 IoU 明显更低（证明漂移确实在主导整行口径）",
+          line_iou < al - 0.10, '整行 %.4f vs 对齐 %.4f' % (line_iou, al))
+
+    # 词数切不齐 → 必须返回 None 让调用方回退，而不是硬算一个假分。
+    # （不能拿"某个词的列区间"当单词语料：`gap_split` 的 Otsu 在间隙全相等时
+    #   阈值会退化，切出来的仍是 3 个词——这个坑也踩过。）
+    one = np.zeros((H, 10), bool)
+    one[2:H, :] = True
+    check("单块掩膜确实只切出 1 个词", len(L.gap_split(one)[0]) == 1,
+          str(L.gap_split(one)[0]))
+    check("词数切不齐时返回 None（调用方回退整行 IoU）",
+          L._word_aligned_iou(one, src) is None)
+    check("任一侧全空也不崩", L._word_aligned_iou(np.zeros((H, 10), bool), src)
+          is None)
+
+
+def test_case_by_height():
+    """行内字高判大小写——真踩过的 `O.v.D.` → `O.V.D.`。
+
+    源图页脚是 `O.V.D. Importadora …`，OCR 交出来 `O.v.D. …`，而且
+    **6 个二值化变体全读成小写 v**（二值化削掉了 V 顶端的细笔画），
+    只有 2 个灰度变体读对。所以：
+      * 多数投票救不了（6 : 2，多数是错的）；
+      * 置信度救不了（错的对的都在 0.906~0.921）；
+      * 逐词 IoU 也救不了——两种口径给出**相反**结论：
+        按高度归一、各自紧裁、铺到较宽画布比 → `O.V.D.` 0.7476 > `O.v.D.` 0.7103；
+        逐词拉伸到源包围盒比 → `O.V.D.` 0.6912 < `O.v.D.` 0.7910。
+        38×13 px 的词里，单字形的大小写差异已在 IoU 类指标的噪声底之下。
+    唯一稳的是**直接量那个字的高度**：x-height 9px、cap-height 12~13px。
+    """
+    XH, CAP, H = 9, 13, 20
+    MARK = '\u00b7'          # 句点类小碎块，高 2px
+
+    def build(spec):
+        """spec: [('字', 高, 宽) | None]，None 表示词间空隙。
+        返回 (gray, words)：gray 是**灰度**图（背景 240、墨迹 0），
+        words 是每个词的 (x0, x1) 列区间。用灰度而不是布尔，是为了
+        顺带把 `_as_mask` 那条路径也测进去。
+        """
+        boxes, words = [], []
+        x, start = 0, None
+        for g in spec:
+            if g is None:
+                if start is not None:
+                    words.append((start, x - 1))
+                    start = None
+                x += 8
+                continue
+            if start is None:
+                start = x
+            _, h, w = g
+            boxes.append((x, x + w, h))
+            x += w + 1
+        if start is not None:
+            words.append((start, x - 1))
+        gray = np.full((H, x), 240, np.uint8)
+        for x0, x1, h in boxes:
+            gray[H - h:, x0:x1] = 0
+        return gray, words
+
+    # 词 1 = 'O.v.D.'（6 个字符）：源图上 V 与 D 之间那个句点墨迹为零，
+    # 所以只有 5 个列段。这正是"列段数 == 字符数"那道守卫会误杀的情形——
+    # 必须按**字母数**对齐。
+    TAIL = [None, ('m', XH, 5), ('e', XH, 5), ('a', XH, 5)]   # 立 x-height 锚点
+
+    gray, words = build([('O', CAP, 5), (MARK, 2, 2), ('v', CAP - 1, 5),
+                         ('D', CAP - 1, 5), (MARK, 2, 2)] + TAIL)
+    w0 = words[0]
+    runs_bool = L._col_runs((gray < 128)[:, w0[0]:w0[1]])
+    runs_gray = L._col_runs(gray[:, w0[0]:w0[1]])
+    check("灰度裁切与布尔掩膜切出同样的列段（_as_mask 归一化生效）",
+          runs_bool == runs_gray, '%s vs %s' % (runs_bool, runs_gray))
+    check("词 1 只有 5 个列段，而它有 6 个字符（不能按字符数对齐）",
+          len(runs_gray) == 5, str(runs_gray))
+
+    props, notes = L.case_by_height(gray, words, ['O.v.D.', 'mea'])
+    check("大写 V 被按字高纠正", props == [(0, 'O.V.D.', 'case-height')],
+          str(props))
+    check("理由带上实测字高，便于人工复核",
+          bool(notes) and 'v->V' in notes[0] and 'x9/cap12' in notes[0],
+          str(notes))
+
+    props, _ = L.case_by_height(gray, words, ['O.V.D.', 'mea'])
+    check("已经是大写时**不提建议**（幂等、不制造无谓改动）",
+          props == [], str(props))
+
+    # 反方向也必须成立：x 高度的 'V' 该被判成小写 v。
+    # 若判据是"总是改成大写"而不是"比高度"，这条会挂。
+    gray2, words2 = build([('O', CAP, 5), (MARK, 2, 2), ('V', XH, 5),
+                           ('D', CAP - 1, 5), (MARK, 2, 2)] + TAIL)
+    props, _ = L.case_by_height(gray2, words2, ['O.V.D.', 'mea'])
+    check("x 高度的 V 反向判成小写 v（说明判据是高度，不是倾向）",
+          props == [(0, 'O.v.D.', 'case-height')], str(props))
+
+    # --- 安全约束：宁可漏判，不可错判 ---
+    gray3, words3 = build([('O', XH, 5), ('v', XH + 1, 5), ('D', XH, 5)] + TAIL)
+    props, _ = L.case_by_height(gray3, words3, ['OvD', 'mea'])
+    check("x-height 与 cap 只差 1px 时整体放弃（不拿噪声当证据）",
+          props == [], str(props))
+
+    g4, w4 = build([('O', CAP, 5), ('v', CAP - 1, 5)])
+    props, _ = L.case_by_height(g4, w4, ['Ov'])
+    check("锚点不足（没有 x-height 样本）时不动", props == [], str(props))
+
+    props, _ = L.case_by_height(gray, words, ['O.v.D.'])
+    check("词数与词列表不一致时放弃（2 个词区间 vs 1 个 token）",
+          props == [], str(props))
+
+    # 真踩过：调用方把整串文本当成词列表传进来。`len('O.v.D. mea')`=10 对上
+    # `len(words)`=2 的守卫 → 静默返回空建议，整条修复等于没接线。
+    # 必须**报错**，不能"顺手 split 一下"把调用方的错掩盖掉。
+    raised = False
+    try:
+        L.case_by_height(gray, words, 'O.v.D. mea')
+    except TypeError:
+        raised = True
+    check("第三个参数传字符串时抛 TypeError（不再静默返回空建议）", raised)
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
@@ -757,6 +950,13 @@ def main():
     print("\n=== E. 保存落盘核验（纯逻辑）===")
     with tempfile.TemporaryDirectory() as tmpdir:
         test_stat_sig(tmpdir)
+
+    print("\n=== F. 字形级纠错与字体相似度（纯逻辑 + 合成图）===")
+    test_as_mask()
+    print()
+    test_word_aligned_iou()
+    print()
+    test_case_by_height()
 
     print()
     if _FAILED:
