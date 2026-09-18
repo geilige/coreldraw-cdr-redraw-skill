@@ -400,7 +400,7 @@ python skills\coreldraw-x8-redraw\scripts\cdr_visual_diff.py ^
   --placement out\placement.json --out compare
 ```
 
-**文字转活字（可选，独立一步）：**
+**文字转活字（流水线的第 2 / 第 4 步）：**
 
 ```powershell
 python skills\coreldraw-x8-redraw\scripts\cdr_text_live.py ^

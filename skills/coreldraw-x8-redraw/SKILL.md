@@ -607,7 +607,7 @@ python scripts\cdr_scan_text.py --image ref.png --out-dir out\scan ^
   墨迹边界——是连通分量判定，不是"附近有墨迹就长"，所以不会吞掉相邻元素。
 - **块分类。** `solid` / `line_art` / `icon` / `mixed` 决定描摹参数与图层命名。
 
-### 文字转活字（可选，独立一步）
+### 文字转活字（流水线的第 2 / 第 4 步）
 
 `scripts/cdr_text_live.py` —— 识别文字 + 匹配字体 + 判定能否转成真文本：
 
