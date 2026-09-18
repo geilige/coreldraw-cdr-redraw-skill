@@ -48,8 +48,12 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cdr_common as C  # noqa: E402
+
 CDR_MM = 3            # cdrMillimeter
-CDR_PORTRAIT = 0
+CDR_PORTRAIT = 0      # cdrPortrait
+CDR_LANDSCAPE = 1     # cdrLandscape（实测：SetSize(210,167.16) 后 Orientation 自报 1）
 CDR_TOPLEFT = 3
 CDR_PNG = 802
 CDR_RGB = 4
@@ -204,12 +208,28 @@ def main(argv=None):
             except Exception:
                 pass
 
+    # 目标文件若正被 CorelDRAW 打开（上一轮自动化刻意"只开不关"留下的文档，
+    # 也可能是用户自己开着看），`SaveAs` / `Save` 会**静默失败**：不抛异常、
+    # 不写盘，日志照常打印"已保存"，只有磁盘没变。整条流水线就会作用在一个
+    # 旧文件上而日志全绿。所以重写之前先把占用解开。
+    released, why = C.release_document(args.output)
+    if released:
+        print(f"已关闭 CorelDRAW 中打开的旧文档，解除占用：{args.output}")
+    elif why not in ("文件不存在", "未在 CorelDRAW 中打开"):
+        print(f"[警告] 未能释放 {args.output}：{why}", file=sys.stderr)
+
     doc = app.CreateDocument()
     doc.Unit = CDR_MM
     doc.SaveAs(args.output, None)        # 要点 2
     page = doc.ActivePage
     page.SetSize(page_w, page_h)
-    page.Orientation = CDR_PORTRAIT
+    # 方向必须由 page_w/page_h 决定，**不能写死**。
+    # `SetSize` 本身已经会按宽高设对方向（宽>高 → Orientation=1 横向），
+    # 但这里曾经无条件写 `page.Orientation = CDR_PORTRAIT(0)`，于是横向图
+    # 被交换成纵向：实测 daiion 那张 210 x 167.16 的稿子变成了
+    # 167.16 x 210，而内容仍按 210 宽排布 → 右侧 43mm 溢出页面。
+    # 纵向图（vonder 那张 210 x 286.4）恰好是对的，所以一直没暴露。
+    page.Orientation = CDR_LANDSCAPE if page_w > page_h else CDR_PORTRAIT
     print(f"页面 {page.SizeWidth:.3f} x {page.SizeHeight:.3f} mm，单位代码 {doc.Unit}")
 
     def cdr_y(top_mm):
@@ -291,6 +311,15 @@ def main(argv=None):
         if key in white_set:
             sh.Fill.ApplyUniformFill(app.CreateRGBColor(255, 255, 255))
             sh.Outline.SetNoOutline()
+        else:
+            # 清单里的 fill 是权威来源：多色稿一个区域一种色，SVG 里虽然已经
+            # 写了 fill，但 CorelDRAW 的 SVG 解析对 fill 的处理不完全可靠，
+            # 导入后再显式赋一次，保证颜色确实落上。
+            frgb = info.get("fill")
+            if frgb:
+                sh.Fill.ApplyUniformFill(
+                    app.CreateRGBColor(*[int(v) for v in frgb]))
+                sh.Outline.SetNoOutline()
 
         doc.ReferencePoint = CDR_TOPLEFT
         px, py = sh.PositionX, sh.PositionY
@@ -317,12 +346,37 @@ def main(argv=None):
         except Exception:
             pass
 
+    # 保存必须**回读磁盘确认**，不能只看 API 没抛异常。
+    # 目标被别的进程占用时 `Save()` 既不报错也不写盘（内存里改动都在，
+    # 所以回读内存核验会全对，只有磁盘没变）。指纹比对是唯一可靠的判据。
+    before = C.file_fingerprint(args.output)
     doc.Save()
-    if not os.path.isfile(args.output):
+    after = C.file_fingerprint(args.output)
+    if after is None:
         print(f"[失败] 保存后找不到文件: {args.output}\n"
               f"       请检查路径是否可写，或用 doc.SaveAs 另存到其他位置。",
               file=sys.stderr)
         return 2
+    if before == after:
+        # 指纹没变有两种可能，必须区分开，否则会误报：
+        #   a) 保存真的失败（文件被别的进程占用）—— 要报错；
+        #   b) 本次保存本就无内容可写 —— 正常，不能报错。
+        # 判据：文件能否被本进程独占打开。打不开 = 被占用 = 属于 a)。
+        locked = False
+        try:
+            with open(args.output, "r+b"):
+                pass
+        except OSError:
+            locked = True
+        if locked:
+            print(f"[失败] Save() 未改变磁盘内容，且文件无法独占打开"
+                  f"（{args.output}，{after[0]} 字节）。\n"
+                  f"       文件被其他进程占用时 Save() 不抛异常也不写盘。\n"
+                  f"       请关闭 CorelDRAW 中打开的该文档后重试。",
+                  file=sys.stderr)
+            return 3
+        print("[提示] Save() 未改变磁盘内容，但文件未被占用"
+              "（本次保存无内容可写），按成功处理。")
     size = os.path.getsize(args.output)
     print(f"\n已保存 {args.output}  ({size} 字节)")
 
@@ -342,9 +396,18 @@ def main(argv=None):
     print(f"定位记录: {pp}")
 
     if args.preview:
-        # 要点 3：ExportEx 在 X8 上不可靠，以 Export 为准，并且必须验文件
-        if os.path.exists(args.preview):
-            os.remove(args.preview)
+        # 要点 3：ExportEx 在 X8 上不可靠，以 Export 为准，并且必须验文件。
+        #
+        # 这里原来写的是"先删掉旧预览，再导出，然后看文件在不在"。删除是为了让
+        # "文件存在"等价于"这次导出真的写了"，但**在受限运行环境里会被安全策略
+        # 判为批量删除并直接掐掉进程**（实测：日志只留一行
+        # SAFE_DELETE_BULK_CONFIRM_REQUIRED，整条流水线莫名 EXIT=1，
+        # 而 CDR 其实已经保存好了，很容易误判成保存失败）。
+        #
+        # 改成**指纹比对**，语义等价且不删任何文件：导出前记一次
+        # `(大小, mtime_ns)`，导出后必须"文件存在且指纹变了"才算成功。
+        # 旧文件被覆盖也会变 mtime，所以不会漏判。
+        before = C.file_fingerprint(args.preview)
         ok = False
         for label, fn in (("Export", lambda: doc.Export(args.preview, CDR_PNG, 1, None, None)),
                           ("ExportEx", lambda: doc.ExportEx(args.preview, CDR_PNG, 1, None, None))):
@@ -355,9 +418,9 @@ def main(argv=None):
             except Exception as exc:
                 print(f"[FAIL] {label}: {type(exc).__name__}: {exc}")
                 continue
-            if os.path.exists(args.preview) and os.path.getsize(args.preview) > 0:
-                print(f"[OK] {label} 导出预览 {args.preview} "
-                      f"({os.path.getsize(args.preview)} 字节)")
+            after = C.file_fingerprint(args.preview)
+            if after is not None and after[0] > 0 and after != before:
+                print(f"[OK] {label} 导出预览 {args.preview} ({after[0]} 字节)")
                 ok = True
             else:
                 print(f"[FAIL] {label} 未写出文件（X8 已知问题，改用 Export）")

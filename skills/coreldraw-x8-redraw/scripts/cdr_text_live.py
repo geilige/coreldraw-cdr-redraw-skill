@@ -41,7 +41,9 @@
 """
 import argparse
 import json
+import math
 import os
+import re
 import sys
 
 import numpy as np
@@ -54,6 +56,22 @@ FONT_DIRS = [r'C:\Windows\Fonts']
 RENDER_PX = 160
 # 转换门槛：候选字体渲染回位图后，与源文字的 IoU 低于它就**不转活字**
 DEFAULT_MIN_IOU = 0.62
+
+# 变体选择时，置信度差小于此值就认为"置信度分不出来"，交给几何证据裁决。
+# 实测 RapidOCR 在 0.8~0.95 区间的抖动有 0.03 上下：vonder 页脚那个
+# 正确变体 0.918、错误变体 0.921，差 0.003 —— 必须让几何证据说话。
+# 而 0.05 又足够窄：明显更差的读法（实测差 0.10）进不了这个子集，
+# 于是不会被"词数恰好对上"这条几何规则抬上来。
+VARIANT_SCORE_TOL = 0.05
+
+# OCR 可读率门槛：11 套预处理变体里，至少要这么多套能读出**非空文本**，
+# 才认为"这块东西真的是一行字"。实测这条是区分**排版文字**与**品牌字标**
+# 最干净的一刀：
+#   排版文字 `www.daiion.com` 8~11 套能读；`4#` 5 套能读；
+#   而 daiion 字标（自制字形）只有 2~3 套能读，且读出来的互不相同
+#   （'oeo' / 'aiion' / '20' / 'uoeo'）。字标是**图形**不是排版文字，
+#   拿一个猜错的字体去"还原"它，比保留描摹轮廓更不像原稿。
+DEFAULT_MIN_OCR_READABLE = 4
 
 
 # --------------------------------------------------------------------------
@@ -246,16 +264,31 @@ def pick_variant(ok):
     """从成功识别出文本的变体里挑一个。就地写回 `agreement` 字段。
 
     **选择顺序**（这是关键，别改回"按置信度选"）：
-      1. `word_gap` 升序 —— `|OCR 词数 − 列投影词数|`。列投影是**独立于
-         OCR 的几何证据**；实测它在该区 100% 分对（9 词的全对、≠9 词的全错），
-         而置信度会把错误的变体排在正确的前面（错误 0.921 > 正确 0.918）。
+      0. 先取"置信度与最优相当"的子集（差 ≤ `VARIANT_SCORE_TOL`）；
+      1. 该子集内按 `word_gap` 升序 —— `|OCR 词数 − 列投影词数|`。
+         列投影是**独立于 OCR 的几何证据**；实测它在该区 100% 分对
+         （9 词的全对、≠9 词的全错），而置信度会把错误的变体排在正确的
+         前面（错误 0.921 > 正确 0.918）。
       2. 置信度降序 —— 仅在 word_gap 相同时打破平局。
       3. 字符数与其它变体的一致性 —— 沿用"至少一个变体同字符数"的校验，
          但**只在 word_gap > 0（几何证据没认可）时才用它翻盘**；
          word_gap == 0 说明几何已经认可，不该被"多数变体"推翻。
+
+    **第 0 步不能省**：把 word_gap 当**绝对**首要键，会让一个明显更差、
+    但词数恰好对上的读法胜出。实测 `www.daiion.com` 那一行，列投影被
+    句点处的窄间隙切成 2 个"词"，于是 `.com www.daion.`（置信 0.756、
+    词数对上）压掉了 `www.daiion.com`（置信 0.859、词数差 1）——
+    而前者根本是错的。加了置信度门槛后，被压掉的正确读法回来了，
+    同时 vonder 页脚那种"两个变体置信度只差 0.003"的情形仍然交给
+    几何证据裁决（差 0.003 远小于 0.05，两个都在子集里）。
     """
-    ok.sort(key=lambda r: (r['word_gap'], -r['score']))
-    pick = ok[0]
+    ok = list(ok)
+    if not ok:
+        return None
+    top = max(r['score'] for r in ok)
+    short = [r for r in ok if r['score'] >= top - VARIANT_SCORE_TOL]
+    short.sort(key=lambda r: (r['word_gap'], -r['score']))
+    pick = short[0]
     agree = [r for r in ok[1:] if r['chars'] == pick['chars']]
     pick['agreement'] = len(agree)
     if not agree and len(ok) > 1 and pick['word_gap'] > 0:
@@ -267,6 +300,219 @@ def pick_variant(ok):
         pick = alt[0]
         pick['agreement'] = len(alt) - 1
     return pick
+
+
+def adjudicate_text(core, report, corel_fonts=None, top_n=6):
+    """用**字形证据**在若干候选文本里裁决。返回 `(最佳文本, 明细表)`。
+
+    **为什么必须有这一步**（真踩过）：`pick_variant` 用的三个量——置信度、
+    词数、变体一致性——全是**统计**证据，而且同源（同一个识别器、同一批
+    预处理），所以它们会**一起**走偏。实测同一款 `www.daiion.com` 在一张
+    拼版稿上印了四份，被读成两种文本：
+
+        区域           OCR 采用             可读/一致   字形 IoU
+        上左 328       'wwww.dalion.com'    9/3         0.3644
+        上右 927       'www.daiion.com'     9/5         0.4823
+        下左 45        'www.daiion.com'    11/5         0.5152
+        下右 646       'www.daiion.com'    11/5         0.5134
+
+    四处像素几乎相同，却有两种读法，而且被采纳的那条在四处**没有一处**
+    是字形最优。把候选渲染出来跟源图比，正确的 `www.daiion.com` 在四处
+    **全部**胜出（0.5374 / 0.4823 / 0.5152 / 0.5134 对次优 0.4432 /
+    0.4460 / 0.4425 / 0.4417），错误的 `wwww.dalion.com` 四次都沉在底部
+    （0.34~0.42）。字形是这里**唯一独立**的证据源。
+
+    取每个候选的**可达上限**（所有字体里逐词对齐 IoU 最高的那个），
+    而不是某个字体的分数：这一步问的是"这串字符**能不能**还原成源形状"，
+    字体选谁由后面的 `match_fonts` 单独决定。两者混在一起会把
+    "字形对但字体不像"的候选压掉。
+
+    代价：每个候选一遍全字体匹配（实测约 1.7s），所以只裁决前 `top_n` 个
+    （按 OCR 置信度取），且调用方只在赢过原值超过 margin 时才改判。
+    """
+    uniq = []
+    for r in report:
+        t = (r.get('text') or '').strip()
+        if not t or any(t == u['text'] for u in uniq):
+            continue
+        uniq.append({'text': t, 'ocr_score': r.get('score'),
+                     'word_gap': r.get('word_gap')})
+    if not uniq:
+        return None, []
+    uniq.sort(key=lambda u: -(u['ocr_score'] or 0.0))
+    uniq = uniq[:top_n]
+
+    table = []
+    for u in uniq:
+        # top 给足：rows 是按**综合分**（iou×0.7 + 宽比×0.3）排序的，
+        # 而这里要的是 iou 的**上限**，只取前几行会把"iou 高但宽比差"的漏掉。
+        rows, _ = match_fonts(core, u['text'], corel_fonts, top=10 ** 9)
+        if not rows:
+            table.append(dict(u, iou=0.0, font=None, width_ratio=None))
+            continue
+        best = max(rows, key=lambda r: r['iou'])
+        table.append(dict(u, iou=best['iou'], iou_line=best['iou_line'],
+                          font='%s/%s' % (best['family'], best['style']),
+                          width_ratio=best['width_ratio']))
+    table.sort(key=lambda d: -d['iou'])
+    return table[0]['text'], table
+
+
+# --------------------------------------------------------------------------
+# 跨实例共识：同一款内容重复出现时，把重复当冗余用
+# --------------------------------------------------------------------------
+
+def col_profile(core, n=64):
+    """列墨迹剖面：每列墨迹数，重采样到固定长度后按峰值归一。
+
+    **为什么不用"归一化掩膜的 IoU"归组**（试过，不行）：极小字上紧裁高度
+    只差 1px（实测同一行网址 75x7 与 75x8），归一化到固定高度后宽度差 13%，
+    同一个内容的 IoU 掉到 0.396，而**不同**内容也有 0.192——阈值放哪都不安全。
+    列剖面比较的是"墨迹沿横向的分布形状"，对 1px 的高度差天然不敏感。
+
+    实测判别力（本图 14 个文字区两两比）：
+        同一内容   L1 ≤ 0.188（多数 < 0.12）
+        不同内容   L1 ≥ 0.254
+    中间留了一倍余量，阈值 0.20 很稳。
+    """
+    c = core.sum(axis=0).astype(np.float32)
+    if c.sum() <= 0 or len(c) < 2:
+        return np.zeros(n, np.float32)
+    p = np.interp(np.linspace(0, len(c) - 1, n), np.arange(len(c)), c)
+    return p / (p.max() + 1e-9)
+
+
+def group_shapes(items, max_profile_l1=0.20, max_aspect_diff=0.25):
+    """把形状几乎相同的区域归成一组。`items` 是 `[{name, core, ...}]`。
+
+    两个条件缺一不可：
+
+    * 列剖面 L1 距离 ≤ `max_profile_l1`——判"墨迹横向分布像不像"；
+    * 宽高比的 log 差 ≤ `max_aspect_diff`——挡"剖面恰好相似"的误并。
+      实测有若干对（如 `www.daiion.com` 与 `4#`）剖面 L1 落在 0.25~0.30，
+      但宽高比 log 差高达 1.9，一刀就切开了。
+
+    用"组代表"（**面积最大的成员**，紧裁掩膜噪声最小）做 leader 聚类，
+    而不是两两连通分量：连通分量会链式合并（A~B、B~C 但 A≁C），
+    而 leader 聚类保证组内每个成员都与代表直接达标。
+    """
+    order = sorted(range(len(items)), key=lambda i: -items[i]['core'].sum())
+    prof = {it['name']: col_profile(it['core']) for it in items}
+    asp = {it['name']: it['core'].shape[1] / max(1, it['core'].shape[0])
+           for it in items}
+    groups = []
+    for i in order:
+        it = items[i]
+        hit = None
+        for g in groups:
+            rep = g['rep']
+            if abs(math.log(asp[it['name']] / asp[rep['name']])) > max_aspect_diff:
+                continue
+            if float(np.abs(prof[it['name']] - prof[rep['name']]).mean()) \
+                    <= max_profile_l1:
+                hit = g
+                break
+        if hit is None:
+            groups.append({'rep': it, 'members': [it]})
+        else:
+            hit['members'].append(it)
+    return groups
+
+
+def vote_text(members, min_region_frac=0.5):
+    """跨实例读法投票。返回 `(胜出读法, 全部票数表)`。
+
+    **为什么投票而不是比 IoU**（真踩过）：这个字号（1.3mm 高 / 145 DPI 源图）
+    下，`www.daiion.com` / `www.dalion.com` / `www.dailon.com` 的差别只有
+    1 个像素，字形 IoU 挤在 0.005 以内——实测把四个实例的 IoU **平均**起来
+    仍然只领先 0.003，还是噪声。而 OCR 的**错误是随机的、真相是共享的**，
+    所以跨实例投票的信噪比远高于任何单实例的形状比较：
+
+        读法                 变体票数   置信和   出现区域数
+        www.daiion.com          12     10.191      4/4
+        wwww.dalion.com          3      2.424      1/4
+        www.dalion.com           2      1.751      1/4
+
+    排序键是 `(出现区域数, 变体票数, 置信和)`，**区域数排第一**：
+    一个实例里 11 套预处理高度相关，它一家投 5 票的含金量远不如
+    四个实例各投 1 票。`min_region_frac` 要求胜出读法至少覆盖一半成员，
+    达不到就返回 None（宁可交给单区域裁决，也不硬凑一个共识）。
+    """
+    votes, nreg = {}, set()
+    for m in members:
+        nreg.add(m['name'])
+        for v in m['ocr_report']:
+            if v.get('error'):
+                continue
+            t = (v.get('text') or '').strip()
+            if not t:
+                continue
+            d = votes.setdefault(t, {'regions': set(), 'n': 0, 'conf': 0.0})
+            d['n'] += 1
+            d['conf'] += float(v.get('score') or 0.0)
+            d['regions'].add(m['name'])
+    rows = [{'text': t, 'regions': len(d['regions']), 'n': d['n'],
+             'conf': round(d['conf'], 3)} for t, d in votes.items()]
+    rows.sort(key=lambda r: (-r['regions'], -r['n'], -r['conf']))
+    need = max(1, int(len(nreg) * min_region_frac + 0.5))
+    top = rows[0] if rows else None
+    if top is None or top['regions'] < need:
+        return None, rows
+    return top['text'], rows
+
+
+def consensus_font(members, text, corel_fonts=None):
+    """组内**共用一个**字体：让所有成员的平均逐词对齐 IoU 最大的那个。
+
+    单独为每个实例选字体是错的：实测同一行 `www.daiion.com` 四处被选成
+    `Swis721 WGL4 BT/Bold`、`Arial/Bold`、`Swis721 WGL4 BT/Roman` 三种，
+    其中 Roman 与 Bold 是**字重差**，印出来肉眼能看出不一致。四处的像素
+    几乎相同，字体本来就该是同一个——把四个实例的证据合起来选，噪声按
+    √n 下降，而且天然保证了组内一致。
+
+    返回 `(最佳行, 明细表, 统计)`；最佳行与 `match_fonts` 的行同构，另外多两个字段：
+    `iou` 换成**组内平均**（各成员在自己的尺寸下算），`iou_min` 是最差成员。
+    """
+    cands = None
+    for f in font_files():
+        vals, wrs = [], []
+        ok = True
+        for m in members:
+            sh, sw = m['core'].shape
+            r = render_mask(text, f)
+            if r is None:
+                ok = False
+                break
+            s = sh / r.shape[0]
+            r2 = resize_mask(r, r.shape[1] * s, sh)
+            wrs.append(r2.shape[1] / sw)
+            r3 = resize_mask(r2, sw, sh)
+            v = _word_aligned_iou(m['core'], r3)
+            vals.append(v if v is not None else _iou(m['core'], r3))
+        if not ok or not vals:
+            continue
+        fam, sty = family_of(f)
+        if corel_fonts and fam not in corel_fonts:
+            continue
+        row = {'family': fam, 'style': sty, 'file': os.path.basename(f),
+               'iou': round(float(np.mean(vals)), 4),
+               'iou_min': round(float(np.min(vals)), 4),
+               'iou_line': None, 'rendered_w_px': None,
+               'width_ratio': round(float(np.mean(wrs)), 3),
+               'n_members': len(vals)}
+        row['score'] = round(row['iou'] * 0.7
+                             + max(0.0, 1 - abs(row['width_ratio'] - 1)) * 0.3, 4)
+        cands = cands or []
+        cands.append(row)
+    if not cands:
+        return None, [], {'n': 0, 'median_iou': 0.0, 'p75_iou': 0.0,
+                          'max_iou': 0.0, 'consensus': True}
+    cands.sort(key=lambda r: -r['score'])
+    ious = sorted(r['iou'] for r in cands)
+    stats = {'n': len(cands), 'median_iou': round(float(np.median(ious)), 4),
+             'p75_iou': round(float(np.percentile(ious, 75)), 4),
+             'max_iou': round(float(max(ious)), 4), 'consensus': True}
+    return cands[0], cands[:12], stats
 
 
 def ocr_lines(mask_img, variants=None, expect_words=None):
@@ -852,16 +1098,21 @@ def glyph_stats(core):
 
 
 def decide_convert(final_iou, lift, width_ratio, n_cc, n_char,
+                   n_ocr_readable=None, n_ocr_agree=None,
                    min_iou=0.72, min_lift=1.25, min_iou_floor=0.35,
                    min_wr=0.65, max_wr=1.50,
-                   min_cc_per_char=0.25, max_cc_per_char=4.0):
+                   min_cc_per_char=0.25, max_cc_per_char=4.0,
+                   min_ocr_readable=DEFAULT_MIN_OCR_READABLE,
+                   min_ocr_agree=1):
     """这一块到底该不该转成活字。返回 verdict + 每条判据的取值 + 拒绝理由。
 
-    四条判据。**前两条是硬门槛**（"这到底是不是一行文字"），后两条是相似度
+    五条判据。**前三条是硬门槛**（"这到底是不是一行文字"），后两条是相似度
     （"像不像这个字体"），后两条满足其一即可：
 
       A. 分量数 / 字符数      必须落在 [min_cc_per_char, max_cc_per_char]
       B. 最佳候选的自然宽度比  必须落在 [min_wr, max_wr]
+      E. OCR 可读率           ≥ `min_ocr_readable` 套变体读出非空文本，
+                              且其中 ≥ `min_ocr_agree` 套与所选读法字符数一致
       C. 绝对 IoU >= min_iou
       D. lift >= min_lift 且 final_iou >= min_iou_floor
 
@@ -895,6 +1146,17 @@ def decide_convert(final_iou, lift, width_ratio, n_cc, n_char,
     **A 与 B 互补**，这是它们能一起用住的原因：
       短幻觉（几个字盖住复杂图形）→ A 抓到，比值偏大；
       长幻觉（长串盖住简单图形）  → B 抓到，自然宽度远大于源宽度。
+
+    **E 是补 A、B 漏掉的那一类：品牌字标（logo wordmark）。**
+      字标的字形是自制的，A、B 都看不出来：实测 `daiion` 字标
+      cc_per_char 1.33（真排版文字的期望值也是 1.33，分不开）、
+      宽度比 0.754（在区间内）。但 E 一眼看穿——11 套预处理变体里
+      只有 2~3 套能读出东西，而且读出来的互不相同
+      （`oeo` / `aiion` / `20` / `uoeo`），而同一张图上的
+      `www.daiion.com` 有 8~11 套能读、其中 4~5 套读出同一个 14 字符。
+      **可读率低 + 读法互相矛盾 = 这块不是排版文字**，保留描摹轮廓。
+      这一条挡住了 6 处字标里 4 处会被错转成 `oeo` / `aiion` 的转换
+      （它们的 lift 1.27~1.87、IoU 0.41~0.61，C/D 都过）。
     """
     nch = max(int(n_char), 1)
     ccr = float(n_cc) / nch
@@ -906,6 +1168,12 @@ def decide_convert(final_iou, lift, width_ratio, n_cc, n_char,
         'width_ratio': {'value': round(width_ratio, 3), 'min': min_wr,
                         'max': max_wr,
                         'ok': min_wr <= width_ratio <= max_wr},
+        'ocr_support': {'readable': n_ocr_readable, 'agree': n_ocr_agree,
+                        'min_readable': min_ocr_readable,
+                        'min_agree': min_ocr_agree,
+                        'ok': (n_ocr_readable is None or n_ocr_agree is None
+                               or (n_ocr_readable >= min_ocr_readable
+                                   and n_ocr_agree >= min_ocr_agree))},
         'abs_iou': {'value': round(final_iou, 4), 'min': min_iou,
                     'ok': final_iou >= min_iou},
         'rel_lift': {'value': round(lift, 3), 'min': min_lift,
@@ -921,7 +1189,14 @@ def decide_convert(final_iou, lift, width_ratio, n_cc, n_char,
         reasons.append('最佳字体的自然宽度比 %.3f 超出 [%.2f, %.2f]——没有哪个'
                        '字体的自然字宽与这块区域的宽高比相符'
                        % (width_ratio, min_wr, max_wr))
-    gate_ok = checks['cc_per_char']['ok'] and checks['width_ratio']['ok']
+    if not checks['ocr_support']['ok']:
+        reasons.append('OCR 支持不足（%d 套变体读出文本，需 ≥%d；其中 %s 套'
+                       '与所选读法字符数一致，需 ≥%d）——读法少或互相矛盾，'
+                       '这块多半是品牌字标而不是排版文字，保留描摹轮廓'
+                       % (n_ocr_readable, min_ocr_readable,
+                          n_ocr_agree, min_ocr_agree))
+    gate_ok = (checks['cc_per_char']['ok'] and checks['width_ratio']['ok']
+               and checks['ocr_support']['ok'])
     sim_ok = checks['abs_iou']['ok'] or checks['rel_lift']['ok']
     if gate_ok and not sim_ok:
         reasons.append('相似度不足（IoU %.4f < %.2f，且领先候选集中位仅 '
@@ -999,6 +1274,23 @@ def _hex_to_rgb(s):
     return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
 
 
+def _live_layer_name(rec, suffix):
+    """活字图层名：优先用**识别出的文本**，不用 OCR 派生的区域名。
+
+    区域名是 `--emit-live` 按 OCR 结果临时拼的，**带着 OCR 的错拼**：实测
+    `wwwdalioncom_330_274`（`dalion` 是 `daiion` 的误读，字形裁决后文本已改对），
+    拿它当图层名会误导看图层的人以为文本还是错的。
+
+    重名用位置区分（同一串文字常有多个实例，本图 4 处 `www.daiion.com`）。
+    文本为空时退回区域名。
+    """
+    txt = re.sub(r'[^0-9A-Za-z._-]+', '', str(rec.get('text') or ''))
+    if not txt:
+        return rec['region'] + suffix
+    box = rec.get('source_box_px') or [0, 0]
+    return '%s_%d_%d%s' % (txt, int(box[0]), int(box[1]), suffix)
+
+
 def _get_layer(page, name, reuse_first=True):
     """取名为 name 的图层；没有就新建。
 
@@ -1037,8 +1329,10 @@ def apply_region(app, page, rec, mm_per_px, layer_suffix, rgb, log=print):
     y_top_mm = box[1] * mm_per_px
     tgt_w, tgt_h = rec['size_mm']
     tgt_y = page_h - y_top_mm
+    rgb = rec.get('rgb') or rgb          # 逐区填色优先于全局 --live-color
+    rot = int(rec.get('rot', 0)) % 360
 
-    lay = _get_layer(page, rec['region'] + layer_suffix)
+    lay = _get_layer(page, _live_layer_name(rec, layer_suffix))
     # **幂等保护**：该图层已有形状就不动它。
     # 否则重跑同一命令会在同一位置叠出第二个文本——两行字重叠，比不转更糟。
     # 也不自动清空：用户可能已经改过这里的文字，静默删除等于吃掉他的编辑。
@@ -1105,6 +1399,20 @@ def apply_region(app, page, rec, mm_per_px, layer_suffix, rgb, log=print):
         except Exception:
             break
 
+    # 旋转（源图里倒置的区域）。必须放在定位校正**之后**：
+    # 绕自身包围盒中心转 180° 时包围盒**逐位不变**（实测最大差 0.0001mm），
+    # 所以先定位再旋转不需要二次校正；反过来先转再定位则要多一轮迭代。
+    if rot:
+        try:
+            bb = shp.BoundingBox
+            cx = (float(bb.Left) + float(bb.Right)) / 2.0
+            cy = (float(bb.Bottom) + float(bb.Top)) / 2.0
+            shp.SetRotationCenter(cx, cy)
+            shp.Rotate(rot)
+            app.Refresh()
+        except Exception as e:
+            return {'ok': False, 'error': '旋转 %d° 失败: %s' % (rot, e)}
+
     try:
         bb = shp.BoundingBox
         got = {'left': round(float(bb.Left), 4), 'top': round(float(bb.Top), 4),
@@ -1116,6 +1424,7 @@ def apply_region(app, page, rec, mm_per_px, layer_suffix, rgb, log=print):
     except Exception:
         got = None
     return {'ok': True, 'layer': str(lay.Name), 'size': info, 'bbox_mm': got,
+            'rot': rot,
             'target_mm': [round(x_mm, 4), round(tgt_y, 4),
                           round(tgt_w, 4), round(tgt_h, 4)],
             'max_error_mm': max(err) if err else None}
@@ -1341,15 +1650,52 @@ def apply_all(args, summary, log=print):
 # --------------------------------------------------------------------------
 
 def parse_region(spec):
-    """NAME=y0,y1,x0,x1 或 NAME=px:y0,y1,x0,x1（源图像素，左上原点）。"""
+    """NAME=y0,y1,x0,x1[,#RRGGBB][,rot=180]（源图像素，左上原点）。
+
+    可选字段写在坐标之后，逗号分隔：
+
+      `#RRGGBB`  —— 该区活字的填色；不写则用 `--live-color`
+      `rot=180`  —— 该区文字在源图里是**倒置**的。识别前把区域转正，
+                    建活字时再把文本框绕自身包围盒中心转 180°。
+                    180° 绕中心旋转**包围盒不变**（实测差 0.0001mm），
+                    所以定位逻辑一行都不用改。
+
+    返回 `(name, (y0,y1,x0,x1), opt)`。
+    """
     if '=' not in spec:
         raise ValueError('区域要写成 NAME=y0,y1,x0,x1')
     name, rest = spec.split('=', 1)
     rest = rest.split(':', 1)[-1]
-    v = [int(t) for t in rest.replace(' ', '').split(',')]
-    if len(v) != 4:
-        raise ValueError('区域坐标要 4 个数')
-    return name.strip(), tuple(v)
+    parts = [p.strip() for p in rest.split(',') if p.strip()]
+
+    def is_hex(p):
+        return p.startswith('#') or (len(p) in (3, 6) and all(
+            c in '0123456789abcdefABCDEF' for c in p))
+
+    # **按位置解析**，不能"看长相"。`635` 既是合法坐标也是合法 3 位十六进制色，
+    # 按长相判会把坐标 `K_C1=635,654,43,129` 的第一个字段吃成颜色
+    # （实测直接报"坐标要 4 个数，收到 1 个"）。前 4 个字段固定是坐标，
+    # 之后的字段才可能是颜色 / rot。
+    nums, opt = [], {}
+    for p in parts:
+        if len(nums) < 4:
+            if not p.lstrip('+-').isdigit():
+                raise ValueError('区域 %s 的前 4 个字段必须是坐标数字，收到 %r'
+                                 % (name, p))
+            nums.append(int(p))
+        elif is_hex(p):
+            opt['color'] = p
+        elif '=' in p:
+            k, v = p.split('=', 1)
+            if k.strip().lower() not in ('rot', 'rotate', 'rotation'):
+                raise ValueError('区域 %s 的未知字段 %r' % (name, p))
+            opt['rot'] = int(v)
+        else:
+            raise ValueError('区域 %s 的第 %d 个字段 %r 既不是颜色也不是选项'
+                             % (name, len(nums) + 1, p))
+    if len(nums) != 4:
+        raise ValueError('区域坐标要 4 个数，收到 %d 个（%s）' % (len(nums), spec))
+    return name.strip(), tuple(nums), opt
 
 
 def main(argv=None):
@@ -1381,6 +1727,33 @@ def main(argv=None):
                     help='硬门槛：连通分量数 ÷ 字符数 的上限（默认 4.0）。'
                          '**这条是拦住"短幻觉"的关键**——真文字实测 1.10，'
                          '把插图区当文字区时会到 11.0')
+    ap.add_argument('--text-candidates', type=int, default=6,
+                    help='字形裁决的候选文本数上限（默认 6，按 OCR 置信度取）。'
+                         '每个候选要跑一遍全字体匹配（实测约 1.7s），'
+                         '调大更稳但更慢；同一批内容重复出现时它是把读法'
+                         '统一起来的关键（见 adjudicate_text）')
+    ap.add_argument('--min-text-margin', type=float, default=0.02,
+                    help='字形裁决改判所需的 IoU 领先幅度（默认 0.02）。'
+                         '低于它说明两个候选本来就难分，不动它——'
+                         '否则会把"运气"当"证据"')
+    ap.add_argument('--no-consensus', action='store_true',
+                    help='关掉跨实例共识，每个区域各自裁决。'
+                         '**默认开启**：拼版稿里同一款内容会重复出现，'
+                         '把重复当冗余用，读法与字体才稳（见 vote_text）')
+    ap.add_argument('--max-profile-l1', type=float, default=0.20,
+                    help='归组阈值：两个区域列剖面 L1 距离 ≤ 它就认为同款内容'
+                         '（默认 0.20；实测同内容 ≤ 0.19、异内容 ≥ 0.25）。'
+                         '调小更保守（宁可不并组）')
+    ap.add_argument('--min-region-frac', type=float, default=0.5,
+                    help='共识读法至少要覆盖这个比例的组内实例（默认 0.5）。'
+                         '达不到就退回单区域裁决——宁可各自判，也不硬凑共识')
+    ap.add_argument('--min-ocr-readable', type=int,
+                    default=DEFAULT_MIN_OCR_READABLE,
+                    help='硬门槛：11 套预处理变体里至少几套能读出非空文本'
+                         '（默认 %d）。**这条拦住品牌字标**——实测同一张图上'
+                         '排版文字 8~11 套能读，而自制字形的 daiion 字标'
+                         '只有 2~3 套能读、且读出来的互不相同。设 0 可关闭'
+                         % DEFAULT_MIN_OCR_READABLE)
     ap.add_argument('--corel-only', action='store_true',
                     help='只用 CorelDRAW 字体表里有的字体（需要 CDR 可用）')
     ap.add_argument('--apply', metavar='CDR', default=None,
@@ -1411,34 +1784,122 @@ def main(argv=None):
             print('读 CorelDRAW 字体表失败（改为不限）：%s' % e)
 
     summary = {}
+
+    # ------------------------------------------------------------------
+    # 预扫 + 跨实例共识
+    # ------------------------------------------------------------------
+    # 先把每个区域的"紧裁掩膜 + OCR"算一遍，按形状分组做共识，**然后**才
+    # 逐区做字体匹配与判定。分两步是因为共识需要全部区域的信息：同一款内容
+    # 在拼版稿上会重复出现，把重复当冗余用，读法与字体就从"单实例的噪声"
+    # 变成"多实例的共识"。实测这个字号（1.3mm 高 / 145 DPI）下，
+    # `www.daiion.com` / `www.dalion.com` / `www.dailon.com` 的差别只有
+    # 1 个像素——单实例无论怎么比都是噪声，四个实例投票才分得开。
+    specs = []
     for spec in args.region:
-        name, (y0, y1, x0, x1) = parse_region(spec)
-        print()
-        print('=' * 74)
-        print('区域 %s  px %d,%d..%d,%d' % (name, x0, y0, x1, y1))
-        print('=' * 74)
+        name, (y0, y1, x0, x1), opt = parse_region(spec)
+        specs.append({'name': name, 'box': (y0, y1, x0, x1), 'opt': opt,
+                      'rot': int(opt.get('rot', 0)) % 360, 'status': 'ok'})
+
+    items = []
+    for s in specs:
+        if s['rot'] not in (0, 180):
+            continue
+        y0, y1, x0, x1 = s['box']
         sub = gray[y0:y1, x0:x1]
+        if s['rot'] == 180:
+            # 整块转正：后面所有几何 / OCR / 字体匹配都按正置文字走。
+            # 矩形绕中心转 180° 还是自己，所以 source_box_px 不必改；
+            # 建字时再把文本转回去（见 apply_region 的 rot 参数）。
+            sub = sub[::-1, ::-1]
         ink = strip_full_height_cols(sub < 128)
         box = tight_text_box(ink)
         if box is None:
-            print('  该区域没有墨迹，跳过')
-            summary[name] = {'status': 'empty'}
+            s['status'] = 'empty'
             continue
         ty0, ty1, tx0, tx1 = box
         core = ink[ty0:ty1, tx0:tx1]
-        th, tw = core.shape
+        words, gaps = gap_split(core)
+        # 从 `sub` 切而不是重新开图：`sub` 已经按 rot 转正过，重新开原图再按
+        # (x0+tx0, y0+ty0) 裁会在 rot=180 时裁到倒置的文字（OCR 读到乱码，
+        # 而且错得很安静）。`load_gray` 就是 `Image.open(...).convert('L')`，
+        # 所以两者像素等价。
+        lines, ocr_report, err = ocr_lines(
+            Image.fromarray(sub[ty0:ty1, tx0:tx1]), expect_words=len(words))
+        s.update({'sub': sub, 'ink': ink, 'tbox': box, 'core': core,
+                  'th': core.shape[0], 'tw': core.shape[1],
+                  'words': words, 'gaps': gaps, 'lines': lines,
+                  'ocr_report': (ocr_report or []), 'err': err})
+        items.append(s)
+
+    consensus = {}
+    if items and not args.no_consensus:
+        groups = group_shapes(items, max_profile_l1=args.max_profile_l1)
+        multi = [g for g in groups if len(g['members']) >= 2]
+        if multi:
+            print()
+            print('=' * 74)
+            print('跨实例共识：%d 组重复内容（重复即冗余）' % len(multi))
+            print('=' * 74)
+        for gi, g in enumerate(groups):
+            if len(g['members']) < 2:
+                continue
+            names = [m['name'] for m in g['members']]
+            print()
+            print('组 %d：%d 个实例  %s' % (gi + 1, len(names), ', '.join(names)))
+            text, rows = vote_text(g['members'], args.min_region_frac)
+            for r in rows[:5]:
+                print('    %s %-22s 区域 %d/%d  变体 %2d 票  置信和 %.3f'
+                      % ('->' if r['text'] == text else '  ',
+                         repr(r['text'])[:22], r['regions'], len(names),
+                         r['n'], r['conf']))
+            if not text:
+                need = max(1, int(len(names) * args.min_region_frac + 0.5))
+                print('    → 没有读法覆盖到 %d 个以上区域，不做共识'
+                      '（退回单区域裁决）' % need)
+                continue
+            font, frows, fst = consensus_font(g['members'], text, corel_fonts)
+            if font:
+                print('    → 共识读法 %r；组内**共用**字体 %s / %s'
+                      '（组内平均 IoU %.4f，最差 %.4f，%d 个实例）'
+                      % (text, font['family'], font['style'], font['iou'],
+                         font['iou_min'], font['n_members']))
+            else:
+                print('    → 共识读法 %r；字体匹配无候选' % text)
+            for m in g['members']:
+                consensus[m['name']] = {
+                    'group': gi + 1, 'members': names, 'text': text,
+                    'font': font, 'font_candidates': frows,
+                    'font_stats': fst, 'votes': rows[:8]}
+
+    for s0 in specs:
+        name = s0['name']
+        y0, y1, x0, x1 = s0['box']
+        opt, rot = s0['opt'], s0['rot']
+        if rot not in (0, 180):
+            print('区域 %s 的 rot=%d 不支持（只支持 0 / 180），跳过' % (name, rot))
+            summary[name] = {'status': 'bad_rot'}
+            continue
+        print()
+        print('=' * 74)
+        print('区域 %s  px %d,%d..%d,%d%s'
+              % (name, x0, y0, x1, y1, '  倒置 rot=180' if rot else ''))
+        print('=' * 74)
+        if s0.get('status') == 'empty':
+            print('  该区域没有墨迹，跳过')
+            summary[name] = {'status': 'empty'}
+            continue
+        # 分析结果全部来自预扫（见上面的"预扫 + 跨实例共识"），这里不再重算：
+        # 重算不但慢一倍，更要紧的是**两次 OCR 可能给出不同结果**，
+        # 那样共识用的读法与判定用的读法就不是同一个了。
+        ty0, ty1, tx0, tx1 = s0['tbox']
+        core, th, tw = s0['core'], s0['th'], s0['tw']
+        words, gaps = s0['words'], s0['gaps']
+        lines, ocr_report, err = s0['lines'], s0['ocr_report'], s0['err']
         print('  紧裁后文字 %dx%d px  = %.3f x %.3f mm'
               % (tw, th, tw * args.mm_per_px, th * args.mm_per_px))
-
-        # --- 列投影切词
-        words, gaps = gap_split(core)
         print('  列投影切出 %d 个词；间隙 %s' % (len(words), gaps[:24]))
 
         # --- OCR
-        crop_img = Image.open(args.image).convert('L').crop(
-            (x0 + tx0, y0 + ty0, x0 + tx1, y0 + ty1))
-        # 把列投影的词数当**几何证据**交给 OCR 选择器（见 ocr_lines 的说明）
-        lines, ocr_report, err = ocr_lines(crop_img, expect_words=len(words))
         if err:
             print('  [警告] %s' % err)
             ocr_text = ''
@@ -1451,11 +1912,55 @@ def main(argv=None):
                     print('    OCR %-16s 置信 %.3f 词 %2d(距 %d) 字符 %3d  %r'
                           % (r['variant'], r['score'], r['words'],
                              r['word_gap'], r['chars'], r['text']))
-            ocr_raw = [{'text': t, 'score': round(s, 4),
+            ocr_raw = [{'text': t, 'score': round(sc, 4),
                         'box': [[int(p[0]), int(p[1])] for p in bx]}
-                       for t, s, bx in lines]
+                       for t, sc, bx in lines]
             ocr_text = ' '.join(t for t, _, _ in lines)
             print('  采用: %r' % ocr_text)
+
+        # --- 文本确定：跨实例共识优先，单区域字形裁决兜底
+        ocr_pick = ocr_text
+        text_adj = []
+        con = consensus.get(name)
+        if con:
+            print('  [共识] 组 %d（%d 个同款实例）读法 %r'
+                  % (con['group'], len(con['members']), con['text']))
+            for r in con['votes'][:4]:
+                print('      %s %-22s 区域 %d/%d  变体 %2d 票  置信和 %.3f'
+                      % ('->' if r['text'] == con['text'] else '  ',
+                         repr(r['text'])[:22], r['regions'],
+                         len(con['members']), r['n'], r['conf']))
+            if con['text'] != ocr_text:
+                print('  [共识] 覆盖本区域的 OCR 采用 %r -> %r'
+                      % (ocr_text, con['text']))
+            ocr_text = con['text']
+        elif ocr_text:
+            # 单实例：只能用形状证据复核。**注意它的能力边界**——这个字号下
+            # 候选之间的 IoU 差常常小于 0.01（噪声底），所以 margin 要设得住，
+            # 达不到就不改判；真正可靠的是上面的跨实例共识。
+            adj_text, text_adj = adjudicate_text(
+                core, [r for r in ocr_report if not r.get('error') and r.get('text')],
+                corel_fonts, top_n=args.text_candidates)
+            if text_adj:
+                print('  候选文本字形裁决（逐词对齐 IoU，取各候选的字体可达上限）:')
+                for d in text_adj:
+                    print('    %s %.4f  %-22s %-24s 宽比 %-5s OCR置信 %s'
+                          % ('->' if d['text'] == adj_text else '  ', d['iou'],
+                             repr(d['text'])[:22], d.get('font') or '-',
+                             d.get('width_ratio'), d.get('ocr_score')))
+            if adj_text and adj_text != ocr_text:
+                cur = next((d['iou'] for d in text_adj if d['text'] == ocr_text), 0.0)
+                new = next((d['iou'] for d in text_adj if d['text'] == adj_text), 0.0)
+                if new - cur >= args.min_text_margin:
+                    print('  字形裁决改判: %r -> %r（IoU %.4f -> %.4f，'
+                          '领先 %.4f ≥ %.3f）'
+                          % (ocr_text, adj_text, cur, new, new - cur,
+                             args.min_text_margin))
+                    ocr_text = adj_text
+                else:
+                    print('  字形裁决**不改判**：%r 只领先 %.4f，未达 %.3f'
+                          '（两个候选本来就难分，不动它）'
+                          % (adj_text, new - cur, args.min_text_margin))
 
         # --- 词边界核对
         # 列投影切出的词数是**几何证据**，OCR 给的空格是**统计证据**。
@@ -1544,12 +2049,25 @@ def main(argv=None):
                           % (final_text, rebuild(text), cur_iou))
 
         # --- 字体匹配（用最终文本）
-        cands, fstats = match_fonts(core, final_text, corel_fonts)
-        print('  候选字体 %d 个，前 5：' % fstats['n'])
-        for i, c in enumerate(cands[:5], 1):
-            print('    %d. %-28s %-14s 综合 %.4f  IoU %.4f  宽度比 %.3f'
-                  % (i, c['family'], c['style'], c['score'], c['iou'],
-                     c['width_ratio']))
+        # 有共识时**直接用组内共用字体**：单独为每个实例选字体是错的——实测
+        # 同一行 `www.daiion.com` 四处被选成 `Swis721 WGL4 BT/Bold`、
+        # `Arial/Bold`、`Swis721 WGL4 BT/Roman` 三种，Roman 与 Bold 是字重差，
+        # 印出来肉眼能看出不一致。四处的像素几乎相同，字体本来就该是同一个。
+        if con and con.get('font'):
+            best = con['font']
+            cands = con['font_candidates']
+            fstats = con['font_stats']
+            print('  候选字体 %d 个（组内共用）；最佳 %s / %s  '
+                  '组内平均 IoU %.4f  最差 %.4f  宽度比 %.3f'
+                  % (fstats['n'], best['family'], best['style'],
+                     best['iou'], best['iou_min'], best['width_ratio']))
+        else:
+            cands, fstats = match_fonts(core, final_text, corel_fonts)
+            print('  候选字体 %d 个，前 5：' % fstats['n'])
+            for i, c in enumerate(cands[:5], 1):
+                print('    %d. %-28s %-14s 综合 %.4f  IoU %.4f  宽度比 %.3f'
+                      % (i, c['family'], c['style'], c['score'], c['iou'],
+                         c['width_ratio']))
 
         if not cands:
             print('  没有可用的候选字体 → 不转活字')
@@ -1584,14 +2102,24 @@ def main(argv=None):
         lift = round(final_iou / med, 3)
         gstat = glyph_stats(core)
         n_char = len(final_text.replace(' ', ''))
+        # OCR 支持度：11 套预处理里几套读得出、几套与所选读法一致。
+        # 这是区分"排版文字"与"品牌字标"的关键证据，见 decide_convert 的 E。
+        n_read = sum(1 for r in (ocr_report or []) if r.get('text'))
+        n_agree = sum(1 for r in (ocr_report or [])
+                      if r.get('text')
+                      and r['chars'] == len(ocr_text.replace(' ', '')))
         dec = decide_convert(
             final_iou, lift, best['width_ratio'], gstat['n_cc'], n_char,
+            n_ocr_readable=n_read, n_ocr_agree=n_agree,
             min_iou=args.min_iou, min_lift=args.min_lift,
             min_iou_floor=args.min_iou_floor,
             min_wr=args.min_width_ratio, max_wr=args.max_width_ratio,
             min_cc_per_char=args.min_cc_per_char,
-            max_cc_per_char=args.max_cc_per_char)
+            max_cc_per_char=args.max_cc_per_char,
+            min_ocr_readable=args.min_ocr_readable)
         verdict = dec['verdict']
+        print('  OCR 支持：%d/%d 套变体读出文本，其中 %d 套与所选读法字符数一致'
+              % (n_read, len(ocr_report or []), n_agree))
         print('  字形统计 %d 个连通分量 / %d 个字符 = %.2f'
               '（中位 %g px，最大/中位 %.2f，填墨率 %.3f）'
               % (gstat['n_cc'], n_char, dec['checks']['cc_per_char']['value'],
@@ -1609,11 +2137,28 @@ def main(argv=None):
         rec = {
             'region': name,
             'source_box_px': [x0 + tx0, y0 + ty0, x0 + tx1, y0 + ty1],
+            # 该区在源图里是否倒置（0 / 180）。识别是在转正后的图上做的，
+            # 建活字时要按这个角度把文本转回去。
+            'rot': rot,
+            # 逐区填色（区域声明里的 #RRGGBB）；None 则用全局 --live-color
+            'rgb': (_hex_to_rgb(opt['color']) if opt.get('color') else None),
             'size_px': [tw, th],
             'size_mm': [round(tw * args.mm_per_px, 4), round(th * args.mm_per_px, 4)],
             'text': final_text,
             'ocr': {'raw': ocr_raw, 'joined': ocr_text,
                     'variants': ocr_report},
+            # 字形裁决：OCR 的"采用"与用形状证据复核后的候选表。
+            # `adopted` 与 `ocr_joined` 不同就说明 OCR 被掰正过，值得人工看一眼。
+            'text_adjudication': {
+                'ocr_adopted': ocr_pick,
+                'changed': bool(ocr_pick) and ocr_pick != ocr_text,
+                'candidates': text_adj,
+            },
+            # 跨实例共识：本区域属于哪一组、组内读法票数。`None` 表示
+            # 它是独苗（没有同款内容），文本只由本区域的证据决定。
+            'consensus': ({'group': con['group'], 'members': con['members'],
+                           'text': con['text'], 'votes': con['votes'][:8]}
+                          if con else None),
             'case_fixes': applied,
             'reverted': None,
             'word_count_by_projection': len(words),
@@ -1645,6 +2190,36 @@ def main(argv=None):
         else:
             print('  → 不转（保留描摹轮廓：字体库里没有足够接近的字体，'
                   '字形相似度不足以证明是同一字体）')
+
+    # --- 判定共识：同一组必须给同一个结论
+    # 同一款内容在一处"转活字"、另一处"保留描摹"是**明显错误**——印出来这两处
+    # 会不一致（一处是可编辑文本、一处是曲线，笔画粗细与抗锯齿都不同）。
+    # 按组统一：多数决；**平票时保守取不转**，因为"该转没转"只是少了可编辑性，
+    # 而"不该转却转了"会改动画面本身。
+    if consensus:
+        by_group = {}
+        for nm, con in consensus.items():
+            by_group.setdefault(con['group'], []).append(nm)
+        for gid, members in sorted(by_group.items()):
+            vs = [(nm, summary.get(nm, {}).get('verdict')) for nm in members]
+            vs = [(nm, v) for nm, v in vs if v]
+            if len(vs) < 2:
+                continue
+            nconv = sum(1 for _, v in vs if v == 'convert')
+            win = 'convert' if nconv * 2 > len(vs) else 'keep_trace'
+            if all(v == win for _, v in vs):
+                continue
+            print()
+            print('判定共识 组 %d：%d 个实例里 %d 个判 convert → 全组统一为 %s'
+                  % (gid, len(vs), nconv, win))
+            for nm, v in vs:
+                rec = summary.get(nm)
+                if v == win or not isinstance(rec, dict):
+                    continue
+                print('    %-24s %s -> %s' % (nm, v, win))
+                rec['verdict'] = win
+                rec['verdict_overridden'] = v
+                rec['applied'] = False
 
     with open(os.path.join(args.out_dir, 'live_text.json'), 'w',
               encoding='utf-8') as f:

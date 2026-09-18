@@ -88,6 +88,11 @@ def main(argv=None):
     S = W / page_w                       # 整页 px/mm
     H = int(round(page_h * S))
     render_w = int(round((cx1 - cx0) * S))
+    # 渲染图导出的是**内容包围盒**，所以左上角要贴在 (cx0, cy0) 而不是 (0, cy0)。
+    # 坑：横向曾写死 0，只要内容左边界不为 0（实测 3.54mm ≈ 42px），
+    # 整幅渲染图就横向错位，元素越小被罚得越狠（大色块 −14pp、小图标 −70pp），
+    # 看起来像"描摹质量差"，其实是**校验本身错了**。下面的自检会拦住这类错误。
+    render_left = int(round(cx0 * S))
     render_top = int(round(cy0 * S))
 
     src_img = load_gray(args.source, W)
@@ -97,7 +102,7 @@ def main(argv=None):
     print(f"内容区 x {cx0:.3f}..{cx1:.3f}  y {cy0:.3f}..{cy1:.3f} mm "
           f"({cx1-cx0:.3f} x {cy1-cy0:.3f})")
     print(f"渲染图 {Image.open(args.render).size} -> 归一到宽 {render_w}px，"
-          f"贴到 y={render_top}px")
+          f"贴到 ({render_left}, {render_top})px")
     exp_h = int(round((cy1 - cy0) * S))
     if abs(ren_img.size[1] - exp_h) > 2:
         print(f"[警告] 渲染图贴入高度 {ren_img.size[1]}px 与内容区期望 "
@@ -109,7 +114,7 @@ def main(argv=None):
     src_page.save(os.path.join(args.out, "page_source.png"))
 
     ren_page = Image.new("L", (W, H), 255)
-    ren_page.paste(ren_img, (0, render_top))
+    ren_page.paste(ren_img, (render_left, render_top))
     ren_page.save(os.path.join(args.out, "page_render.png"))
 
     side = Image.new("L", (W * 2 + 24, H), 200)
@@ -125,6 +130,38 @@ def main(argv=None):
     rgb[a & ~b] = (235, 60, 60)
     rgb[b & ~a] = (60, 120, 235)
     Image.fromarray(rgb).save(os.path.join(args.out, "overlay_diff.png"))
+
+    # -- 配准自检：确认"零偏移"确实是最优的 -------------------------------
+    # 这类校验最大的风险不是算错分数，而是**贴错了位置还报出低分**，
+    # 让人误以为描摹质量差。所以每次都比一遍邻域：若某个平移明显更好，
+    # 说明配准本身有问题，必须报出来而不是把低分当成结论。
+    def _iou_shift(dx, dy):
+        bb = np.roll(np.roll(b, dy, axis=0), dx, axis=1)
+        u = int((a | bb).sum())
+        return (int((a & bb).sum()) / u * 100) if u else 0.0
+
+    base = _iou_shift(0, 0)
+    coarse = max(((dx, dy) for dy in range(-12, 13, 3)
+                  for dx in range(-12, 13, 3)), key=lambda d: _iou_shift(*d))
+    fine = max(((dx, dy) for dy in range(coarse[1] - 3, coarse[1] + 4)
+                for dx in range(coarse[0] - 3, coarse[0] + 4)),
+               key=lambda d: _iou_shift(*d))
+    best_iou = _iou_shift(*fine)
+    if fine != (0, 0) and best_iou - base > 1.0:
+        print()
+        print("!" * 68)
+        print(f"[配准自检失败] 零偏移 IoU {base:.2f}%，"
+              f"但平移 dx={fine[0]} dy={fine[1]} 可达 {best_iou:.2f}%"
+              f"（+{best_iou - base:.2f}pp）")
+        print(f"  位置换算：dx={fine[0]}px = {fine[0]/S:.3f}mm，"
+              f"dy={fine[1]}px = {fine[1]/S:.3f}mm")
+        print("  这说明渲染图**没贴在内容包围盒的正确位置**，")
+        print("  下面的分数是被错位拖低的假数字，不要据此判断描摹质量。")
+        print("!" * 68)
+    else:
+        print()
+        print(f"配准自检通过：零偏移即最优（邻域内最好 {best_iou:.2f}%"
+              f"{'，与零偏移同分' if fine == (0, 0) else f'，提升 {best_iou - base:.2f}pp 可忽略'}）")
 
     print()
     print("=== 整页配准指标（墨迹像素）===")

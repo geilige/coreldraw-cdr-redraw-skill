@@ -23,8 +23,12 @@ D. OCR 预处理与变体选择（纯逻辑）
    - binarize          反白字的极性保护
    - pick_variant      用列投影词数选变体，**不能按置信度选**
 
-E. 保存落盘核验（纯逻辑）
+E. 保存落盘核验与占用释放（纯逻辑）
    - _stat_sig         判断"保存有没有真的写进文件"
+   - file_fingerprint  同上，公共模块版本
+   - find_open_document 按绝对路径找已打开的文档（同名不同目录不能误伤）
+   - release_document  重写目标 CDR 前解除 CorelDRAW 的占用；
+                       Dirty=True 必须拒绝关闭
 
 合成图是刻意设计的，每一处都对应一个真实踩过的坑：
 左侧 4 列 + 顶部 3 行贯穿残留、满版色带被反白字掏空、同一行两个内容块、
@@ -69,9 +73,11 @@ from PIL import Image                                     # noqa: E402
 
 import cdr_prompt_builder                                 # noqa: E402
 import cdr_redraw                                         # noqa: E402
+import cdr_common as C                                    # noqa: E402
 import cdr_image_trace as T                               # noqa: E402
 import cdr_bitmap_to_cdr as B                             # noqa: E402
 import cdr_text_live as L                                 # noqa: E402
+import cdr_scan_text as S                                 # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -396,8 +402,74 @@ def test_rasterize_supersample():
                       2, 1, 1.0, 0.0, 0.0, ss=1).dtype == bool)
 
 
+def test_corner_segments():
+    """角点段必须输出**两个** L（顶点 + 段末中点），漏掉顶点会把角整个切掉。
+
+    真踩过：一个 174x217 的实心洋红色块，召回只剩 **75%**，而且五个
+    二值化阈值全在 75% 上下打转——因为它是几何错误，不是参数问题。
+
+    根因在 potrace 的曲线表示：段 j 的 `c[1]` 是多边形顶点 `v_j`、
+    `c[2]` 是**下一条边的中点** `mid(v_j, v_{j+1})`（见 potracer
+    `_smooth` 里 `c[1]=vertex`、`c[2]=p4=interval(1/2, vertex[k], vertex[j])`）。
+    所以一条角点段是"经过顶点、到下一个中点"的折线；只写 `L c[2]`
+    就等于只连各边中点——**实心矩形被描成菱形**。
+
+    一般图形察觉不到，是因为 potrace 的多边形顶点通常密到 ~1px 一个，
+    切掉顶点只损失不到 1px。只有顶点稀疏的简单形状（实心矩形、直边色块）
+    才暴露。所以这条断言必须用**稀疏多边形**做夹具。
+    """
+
+    def trace(m):
+        svg, subs, _ = T.mask_to_svg(m, 1.0, 0, 0, 0, 1.0, 0.1)
+        vx, vy = T.svg_viewbox(svg)[:2]
+        cov = T.rasterize(svg, m.shape[1], m.shape[0], 1.0, vx, vy, ss=4)
+        a = cov >= 0.5
+        return svg, subs, a
+
+    H, W = 40, 60
+    m = np.zeros((H, W), bool)
+    m[5:35, 10:50] = True
+    svg, subs, a = trace(m)
+    d = subs[0]
+    for cx, cy in ((10, 5), (50, 5), (50, 35), (10, 35)):
+        check(f"实心矩形角点 ({cx},{cy}) 出现在路径里（切角时会缺）",
+              f"L{cx}.0000,{cy}.0000" in d, d[:70])
+    iou = (a & m).sum() / (a | m).sum()
+    check("实心矩形描摹 IoU ≥ 99%（只连边中点时会掉到 ~50%）", iou >= 0.99,
+          f"IoU {iou * 100:.2f}%")
+    check("实心矩形渲染面积与掩膜同量级（切角时会只剩一半）",
+          abs(int(a.sum()) - int(m.sum())) / m.sum() < 0.05,
+          f"{a.sum()} vs {m.sum()}")
+
+    # 贴着画布右边界的实心块：描摹结果不能出现楔形缺口
+    m2 = np.zeros((H, W), bool)
+    m2[5:35, 10:W] = True
+    _, _, a2 = trace(m2)
+    iou2 = (a2 & m2).sum() / (a2 | m2).sum()
+    check("贴右边界的实心块 IoU ≥ 99%（曾出现楔形缺口）", iou2 >= 0.99,
+          f"IoU {iou2 * 100:.2f}%")
+
+    # 带镂空：内轮廓也必须闭合、不被切角
+    m3 = m.copy()
+    m3[15:25, 25:45] = False
+    _, subs3, a3 = trace(m3)
+    iou3 = (a3 & m3).sum() / (a3 | m3).sum()
+    check("带矩形镂空 IoU ≥ 98%", iou3 >= 0.98, f"IoU {iou3 * 100:.2f}%")
+    check("镂空区在渲染结果里确实是空的", not a3[19, 34], str(a3[19, 34]))
+
+    # 两个分离的实心块：各是一条子路径，都不许被切角
+    m4 = np.zeros((H, W), bool)
+    m4[5:35, 10:30] = True
+    m4[10:30, 35:50] = True
+    _, subs4, a4 = trace(m4)
+    iou4 = (a4 & m4).sum() / (a4 | m4).sum()
+    check("两个分离实心块 -> 2 条子路径", len(subs4) == 2, str(len(subs4)))
+    check("两个分离实心块 IoU ≥ 99%", iou4 >= 0.99, f"IoU {iou4 * 100:.2f}%")
+
+
 def test_full_bleed_guard():
     """满版色带的横向贯通判据：每一列都必须有墨迹。"""
+
     ink = np.zeros((H, W), bool)
     # 真满版色带：横向贯通（中间被反白字掏空，但字的上下仍有纯底色行）
     ink[500:580, :] = True
@@ -718,6 +790,161 @@ def test_stat_sig(tmpdir):
           s3 == s2, f"{s2} -> {s3}")
 
 
+class _FakeDoc:
+    """最小 Document 桩，只实现 release_document 用到的属性。"""
+
+    def __init__(self, path, dirty=False, full=True):
+        self._path = path
+        self.Dirty = dirty
+        self.closed = 0
+        self._full = full
+
+    @property
+    def FullFileName(self):
+        return self._path if self._full else ""
+
+    @property
+    def FilePath(self):
+        return os.path.dirname(self._path) + os.sep
+
+    @property
+    def Name(self):
+        return os.path.basename(self._path)
+
+    def Close(self):
+        self.closed += 1
+
+
+class _FakeDocs:
+    def __init__(self, docs):
+        self._docs = list(docs)
+
+    @property
+    def Count(self):
+        return len(self._docs)
+
+    def Item(self, i):
+        return self._docs[i - 1]
+
+
+class _FakeApp:
+    def __init__(self, docs=()):
+        self.Documents = _FakeDocs(docs)
+
+
+def test_release_document(tmpdir):
+    """`file_fingerprint` / `find_open_document` / `release_document`。
+
+    动机是一连串真实故障，三条互相咬合：
+
+    1. `cdr_text_live.py --apply` 走 `open_document()`，**刻意只开不关**
+       （把成果留在 CorelDRAW 窗口里给用户接着改）；
+    2. 于是**下一轮**重建时目标 CDR 被自己上一轮留下的文档占着，
+       `os.replace` 抛 `PermissionError [WinError 32]`，流水线在第 3 步前就死；
+    3. 更坏的是 `SaveAs` / `Save` 在被占用时**静默失败** —— 不抛异常、不写盘，
+       日志照常"已保存"，只有磁盘没变。整轮跑完、回读内存核验还全对。
+
+    所以这里要测死的契约：
+    - 路径比对按**绝对路径规范化**，不同目录的同名文件不能误伤；
+    - `FullFileName` 拿不到时要能退回 `FilePath + Name`；
+    - **Dirty=True 必须拒绝关闭**（那是用户的改动，不能替用户丢）；
+    - 一切"没能关掉"的路径都必须返回 False，让调用方看得见。
+    """
+    # ---- file_fingerprint ----
+    miss = os.path.join(tmpdir, "nope.cdr")
+    check("指纹：文件不存在返回 None", C.file_fingerprint(miss) is None)
+
+    p = os.path.join(tmpdir, "sig.cdr")
+    with open(p, "wb") as f:
+        f.write(b"x" * 7)
+    fp = C.file_fingerprint(p)
+    st = os.stat(p)
+    check("指纹：(大小, mtime_ns) 与 os.stat 一致",
+          fp == (st.st_size, st.st_mtime_ns), f"得到 {fp}")
+
+    time.sleep(0.01)
+    with open(p, "ab") as f:
+        f.write(b"yy")
+    check("指纹：追加写入后必须变（否则核验抓不到\"没落盘\"）",
+          C.file_fingerprint(p) != fp)
+
+    # ---- find_open_document ----
+    target = os.path.join(tmpdir, "panel.cdr")
+    # 必须真的落到磁盘上：release_document 第一道闸就是"文件存不存在"，
+    # 不建文件的话后面每条都会短路成 (False, '文件不存在')，测了个寂寞。
+    with open(target, "wb") as f:
+        f.write(b"cdr")
+    other_dir = os.path.join(tmpdir, "sub")
+    os.makedirs(other_dir, exist_ok=True)
+    same_name = os.path.join(other_dir, "panel.cdr")
+
+    d_hit = _FakeDoc(target)
+    d_same = _FakeDoc(same_name)
+    d_other = _FakeDoc(os.path.join(tmpdir, "other.cdr"))
+    app = _FakeApp([d_same, d_other, d_hit])
+
+    check("查找：按绝对路径命中正确的那一个",
+          C.find_open_document(app, target) is d_hit)
+    check("查找：不同目录的同名文件不会误伤",
+          C.find_open_document(app, same_name) is d_same)
+    check("查找：没打开时返回 None",
+          C.find_open_document(app, os.path.join(tmpdir, "ghost.cdr")) is None)
+
+    check("查找：大小写与斜杠方向不同也能命中",
+          C.find_open_document(
+              _FakeApp([d_hit]), target.replace("\\", "/").upper()) is d_hit)
+
+    d_nofull = _FakeDoc(target, full=False)
+    check("查找：FullFileName 为空时退回 FilePath + Name",
+          C.find_open_document(_FakeApp([d_nofull]), target) is d_nofull)
+
+    check("查找：文档集合为空时安全返回 None",
+          C.find_open_document(_FakeApp([]), target) is None)
+
+    # ---- release_document ----
+    real_attach = C.attach_coreldraw
+    try:
+        C.attach_coreldraw = lambda *a, **k: None
+        check("释放：文件不存在 -> (False, 文件不存在)",
+              C.release_document(miss) == (False, "文件不存在"))
+        check("释放：附加不上 CorelDRAW -> 返回 False 而不是抛异常",
+              C.release_document(target) == (False, "无法附加到 CorelDRAW"))
+    finally:
+        C.attach_coreldraw = real_attach
+
+    d_absent = _FakeDoc(os.path.join(tmpdir, "other.cdr"))
+    try:
+        C.attach_coreldraw = lambda *a, **k: _FakeApp([d_absent])
+        ok, why = C.release_document(target)
+        check("释放：文档没打开 -> (False, 未在 CorelDRAW 中打开)",
+              (ok, why) == (False, "未在 CorelDRAW 中打开"), f"得到 {why}")
+
+        # Dirty=False：干净文档，可以关
+        d_clean = _FakeDoc(target, dirty=False)
+        C.attach_coreldraw = lambda *a, **k: _FakeApp([d_clean])
+        ok, why = C.release_document(target)
+        check("释放：干净文档被关闭", ok is True and why == "已关闭",
+              f"得到 {(ok, why)}")
+        check("释放：确实调用了 Close()", d_clean.closed == 1,
+              f"Close 调用了 {d_clean.closed} 次")
+
+        # Dirty=True：有未保存改动，必须拒绝
+        d_dirty = _FakeDoc(target, dirty=True)
+        C.attach_coreldraw = lambda *a, **k: _FakeApp([d_dirty])
+        ok, why = C.release_document(target)
+        check("释放：Dirty=True 必须拒绝关闭（用户的改动不能替用户丢）",
+              ok is False and "拒绝关闭" in why, f"得到 {(ok, why)}")
+        check("释放：拒绝关闭时绝不能调 Close()", d_dirty.closed == 0,
+              f"Close 调用了 {d_dirty.closed} 次")
+
+        # 显式 allow_dirty：调用方已知情并承担
+        ok, why = C.release_document(target, allow_dirty=True)
+        check("释放：allow_dirty=True 时才允许关掉脏文档",
+              ok is True and d_dirty.closed == 1, f"得到 {(ok, why)}")
+    finally:
+        C.attach_coreldraw = real_attach
+
+
 # ---------------------------------------------------------------------------
 # F. 字形级纠错与字体相似度（纯逻辑 + 合成图）
 # ---------------------------------------------------------------------------
@@ -907,6 +1134,257 @@ def test_case_by_height():
     check("第三个参数传字符串时抛 TypeError（不再静默返回空建议）", raised)
 
 
+def test_parse_region_fields():
+    """区域声明的字段解析：坐标是**位置固定**的，不是靠"像不像色值"猜。
+
+    真踩过：`K_C1=635,654,43,129` 里的 `635` 是 3 位十六进制合法长度，
+    被 `len(p) in (3, 6)` 那条"像色值"的启发式判成了颜色，于是 4 个坐标
+    只剩 3 个 → 整条区域声明报错。坐标必须在前面按位置吃，可选字段才按形态认。
+    """
+    name, box, opt = L.parse_region('K_C1=635,654,43,129')
+    check("3 位数字坐标不被误判成色值", box == (635, 654, 43, 129), str(box))
+    check("无可选字段时 opt 为空", opt == {}, str(opt))
+
+    _, box, opt = L.parse_region('K_A5=270,288,326,412,#1A1819,rot=180')
+    check("坐标 + 颜色 + 旋转都解析出来",
+          box == (270, 288, 326, 412) and opt.get('rot') == 180
+          and opt.get('color') == '#1A1819', f"{box} {opt}")
+
+    _, _, opt = L.parse_region('X=1,2,3,4,#abc')
+    check("3 位简写色值在**可选字段位置**能识别", opt.get('color') == '#abc',
+          str(opt))
+
+    for bad in ('W=1,2,3', 'V=1,2,3,4,zzz'):
+        try:
+            L.parse_region(bad)
+            check(f"非法区域声明 {bad!r} 必须报错", False, "竟然通过了")
+        except ValueError:
+            check(f"非法区域声明 {bad!r} 报 ValueError", True)
+
+
+def _aa_square(a, r0, r1, c0, c1, ink, rings=((2, 0.25), (1, 0.5))):
+    """在画布 `a` 上画一个**带抗锯齿斜坡**的实心方块。
+
+    抗锯齿像素 = 背景与墨色的线性混合，混合系数就是覆盖率——真实位图的
+    边缘正是这个样子，`detect_palette` / `color_space` 的全部设计都针对它。
+    斜坡由外向内写，保证内圈覆盖外圈。
+    """
+    bg = np.array([255.0, 255.0, 255.0], np.float32)
+    ink = np.asarray(ink, np.float32)
+    a[r0:r1, c0:c1] = ink.astype(np.uint8)
+    for off, cov in sorted(rings, reverse=True):
+        for y in range(r0 - off, r1 + off):
+            for x in range(c0 - off, c1 + off):
+                if r0 <= y < r1 and c0 <= x < c1:
+                    continue
+                if 0 <= y < a.shape[0] and 0 <= x < a.shape[1]:
+                    a[y, x] = (bg + cov * (ink - bg)).astype(np.uint8)
+    return a
+
+
+def test_detect_palette():
+    """调色板提取必须**穿过抗锯齿斜坡**找到墨色本身。
+
+    两个实测踩过的坑，各对应一条断言：
+
+    * 按**颜色半径**聚类 → 同一个洋红被拆成
+      `#C62F7C / #B63B7A / #BD6A94 / #CF6EA4 / #DF89B6` 五个假色，
+      连背景都被误报成墨色。本图实测自动提取出 5 色。
+    * 代表色取**簇内最远的像素** → 被重采样过冲带偏：洋红报成 `#BF2B75`、
+      黑报成 `#161415`（真值 `#C62F7C` / `#1A1819`），CDR 填色跟着错。
+    """
+    MAG, BLK = (198, 47, 124), (26, 24, 25)
+    a = np.full((60, 120, 3), 255, np.uint8)
+    _aa_square(a, 6, 25, 11, 50, MAG)
+    _aa_square(a, 35, 54, 11, 50, BLK)
+
+    pal, bg = S.detect_palette(a)
+    check("恰好提取出 2 个墨色（斜坡没被拆成多个假色）", len(pal) == 2, str(pal))
+    check("背景取到精确色 #FFFFFF", tuple(bg) == (255, 255, 255), str(bg))
+
+    for want in (MAG, BLK):
+        hit = min(pal, key=lambda c: max(abs(c[i] - want[i]) for i in range(3)),
+                  default=None)
+        d = max(abs(hit[i] - want[i]) for i in range(3)) if hit else 999
+        check(f"墨色 #{want[0]:02X}{want[1]:02X}{want[2]:02X} 分量误差 ≤ 2",
+              d <= 2, f"实测 {hit}，最大分量差 {d}")
+
+
+def test_color_space_direction():
+    """按**相对背景的方向**分色：黑的抗锯齿灰边不能被算成洋红。
+
+    欧氏最近色在这里是错的：`#8C8C8C` 到洋红 `#C62F7C` 的距离比到黑
+    `#1A1819` **更近**（110.8 < 199.2），于是黑字/黑图标的整圈灰边被判给
+    洋红，每个图标位置都凭空多出一份"假洋红"块。
+    """
+    MAG, BLK = (198, 47, 124), (26, 24, 25)
+    a = np.full((60, 120, 3), 255, np.uint8)
+    _aa_square(a, 6, 25, 11, 50, MAG)
+    _aa_square(a, 35, 54, 11, 50, BLK)
+
+    pal, bg = S.detect_palette(a)
+    if len(pal) != 2:
+        check("分色测试需要先提取出 2 色", False, str(pal))
+        return
+
+    def near(c):
+        return min(range(len(pal)),
+                   key=lambda i: max(abs(pal[i][k] - c[k]) for k in range(3)))
+
+    mi, bi = near(MAG), near(BLK)
+    label, _ = S.color_space(a, pal, bg)
+
+    # 含抗锯齿边的整片区域（外扩到方块之外 2px）
+    blk_area = label[33:56, 9:52]
+    mag_area = label[4:27, 9:52]
+    n_bad = int((blk_area == mi).sum())
+    check("黑块（含灰边）里没有一个像素被判成洋红", n_bad == 0,
+          f"误判 {n_bad} px")
+    n_bad2 = int((mag_area == bi).sum())
+    check("洋红块（含灰边）里没有一个像素被判成黑", n_bad2 == 0,
+          f"误判 {n_bad2} px")
+
+    # 把"为什么不能用欧氏最近色"钉住：这条对照断言让测试本身有意义
+    gray = np.array([140, 140, 140], np.float32)
+    d_mag = float(np.linalg.norm(gray - np.asarray(MAG, np.float32)))
+    d_blk = float(np.linalg.norm(gray - np.asarray(BLK, np.float32)))
+    check("（对照）欧氏最近色会把黑字的灰边判给洋红",
+          d_mag < d_blk, f"到洋红 {d_mag:.1f} < 到黑 {d_blk:.1f}")
+
+
+def test_blocks_tight_bbox():
+    """块的包围盒与掩膜必须**同源**（都取紧框），否则填墨率的分母分子对不上。
+
+    真踩过：包围盒取紧框、掩膜取膨胀后的整块矩形，于是一圈细边框的
+    填墨率被算成 **0.928**（真实 0.074），块分类跟着全错。
+    """
+    m = np.zeros((60, 100), bool)
+    m[10, 10:90] = True
+    m[49, 10:90] = True
+    m[10:50, 10] = True
+    m[10:50, 89] = True
+
+    blks = S._blocks(m, 1)
+    check("细边框聚成 1 块", len(blks) == 1, f"{len(blks)} 块")
+    if len(blks) != 1:
+        return
+    b = blks[0]
+    check("包围盒是紧框（不是膨胀后的框）", b['box'] == [10, 10, 90, 50],
+          str(b['box']))
+    check("掩膜尺寸与包围盒一致", b['mask'].shape == (40, 80),
+          str(b['mask'].shape))
+
+    f = S.block_features(b)
+    check("细边框填墨率 < 0.15", f['fill'] < 0.15, f"fill={f['fill']}")
+    check("细边框判为线稿", S.classify_block(f) == 'line_art',
+          S.classify_block(f))
+
+    # 实心块走另一支：填墨率高 + 面积够 → solid
+    solid = np.zeros((60, 100), bool)
+    solid[10:50, 10:90] = True
+    fs = S.block_features(S._blocks(solid, 1)[0])
+    check("实心块判为 solid", S.classify_block(fs) == 'solid',
+          f"fill={fs['fill']} kind={S.classify_block(fs)}")
+    check("实心块的 thick_px 是内径（远大于笔画宽）", fs['thick_px'] > 20,
+          f"thick_px={fs['thick_px']}")
+
+
+def test_orientation_votes():
+    """方向判定必须靠**字形证据**，不能只靠 OCR。
+
+    真踩过：`www.daiion.com` 与 `daiion` 正置倒置在 0° 那遍**都**读得出来，
+    只有 2 个字符的 `4#` 在 0° 那遍整块漏检。于是"只在 180° 出现才算倒置"
+    这条规则只对短文本有效，本图 4 处长文本被全部误标成正置。
+
+    这里用"渲染一份、再翻转比对"的自洽测试：正置掩膜应判 0°，
+    翻转后的同一掩膜应判 180°。掩膜按 px=64 渲染、函数内部按
+    RENDER_PX=160 渲染再缩回来，所以 IoU 不是 1.0，是真在比形状。
+    """
+    fonts = S.orient_fonts(3)
+    if not fonts:
+        check("方向判定需要至少一款参照字体", False, "本机没找到")
+        return
+
+    m = L.render_mask('daiion', fonts[0], px=64)
+    if m is None:
+        check("参照字体可渲染", False, fonts[0])
+        return
+
+    i0, i180, deg = S.orientation_votes(m, 'daiion', fonts)
+    check("正置掩膜判为 0°", deg == 0, f"iou0={i0} iou180={i180} deg={deg}")
+    check("正置时 iou0 高于 iou180", i0 > i180, f"{i0} vs {i180}")
+
+    f0, f180, fdeg = S.orientation_votes(m[::-1, ::-1], 'daiion', fonts)
+    check("翻转后的掩膜判为 180°", fdeg == 180,
+          f"iou0={f0} iou180={f180} deg={fdeg}")
+    check("翻转后 iou180 高于 iou0", f180 > f0, f"{f180} vs {f0}")
+
+    # 方向证据必须**显著**才改判：左右对称性强的短串差距小，不能硬分
+    check("方向判定的差距明显（不是勉强分的）", min(abs(i0 - i180),
+          abs(f180 - f0)) > 0.05, f"{abs(i0 - i180):.4f}")
+
+
+def test_snap_box_to_ink():
+    """OCR 的框只包住字形芯部，必须扩到**与之相连**的墨迹边界。
+
+    真踩过（两处，都不报错）：
+
+    * 倒置的 `daiion` 字标：两个 `i` 点朝下落在 y529..535，OCR 框止于
+      y531 —— 点被切掉一半，成品里活字缺字 / 描摹区漏元素；
+    * vonder 页脚那个几乎看不见的句点：3 个杂散像素被并进相邻字的列段，
+      把"字宽"从 8px 撑成 10px，直接毁掉大小写判据。
+
+    而**不能**按"框外有墨迹就往外长"：实测 `www.daiion.com` 的框离下面的
+    框线只有 5px，那样会把整条框线并进来。所以判据是"连通分量是否与框相交"。
+    """
+    if S.cv2 is None:
+        check("框吸附需要 opencv", False, "本机没有 cv2")
+        return
+
+    H, W = 60, 80
+    # 字形 1：竖杆 + 相连的横杆（同一个连通分量）
+    m = np.zeros((H, W), bool)
+    m[20:50, 30:34] = True          # 竖杆
+    m[16:20, 20:44] = True          # 横杆，与竖杆相接
+    # 字形 2：一个**分离**的小点（另一个连通分量）
+    m[16:22, 60:66] = True
+
+    # (a) 框只盖住竖杆下段，但横杆同属一个连通分量 -> 必须长上去
+    box = [30, 24, 34, 50]
+    got = S.snap_box_to_ink(m, box, max_grow=20)
+    check("相连的笔画被吸附进来（竖杆 -> 含横杆）",
+          got[0] <= 20 and got[1] <= 16,
+          f"框 {box} -> {got}（应含 x20..44 / y16）")
+
+    # (b) 分离的点**不**与框相交 -> 不能被吞进来
+    check("不相交的分离元素不被吞进来", got[2] <= 44,
+          f"x1={got[2]}（应 <= 44，不能把 x60 那个点并进来）")
+
+    # (c) 点与框**部分相交** -> 整颗点都要，不能只取相交那一半
+    box2 = [60, 19, 66, 40]         # y19 落在点的 y16..22 里，点被切掉上半
+    got2 = S.snap_box_to_ink(m, box2, max_grow=20)
+    check("部分相交的点扩成整颗", got2[1] <= 16,
+          f"框 {box2} -> {got2}（应上扩到 y16）")
+
+    # (d) 框本来就包全了 -> 不变
+    box3 = [20, 16, 44, 50]
+    got3 = S.snap_box_to_ink(m, box3, max_grow=20)
+    check("框已包全时不变", got3 == box3, f"{box3} -> {got3}")
+
+    # (e) 空掩膜不能崩，也不能把框改坏
+    empty = np.zeros((H, W), bool)
+    check("空掩膜原样返回", S.snap_box_to_ink(empty, [10, 10, 20, 20]) ==
+          [10, 10, 20, 20])
+
+    # (f) max_grow 之外的东西够不到（窗口限制）
+    far = np.zeros((H, W), bool)
+    far[20:30, 30:34] = True
+    far[20:30, 70:74] = True        # 距框 40px
+    got4 = S.snap_box_to_ink(far, [30, 20, 34, 30], max_grow=5)
+    check("max_grow 之外的不被吸附", got4[2] <= 40,
+          f"x1={got4[2]}（应 <= 40）")
+
+
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
@@ -929,6 +1407,8 @@ def main():
         print()
         test_rasterize_supersample()
         print()
+        test_corner_segments()
+        print()
         test_shim_source(tmpdir)
     print()
     test_pick_thresholds()
@@ -947,9 +1427,11 @@ def main():
     print()
     test_pick_variant()
 
-    print("\n=== E. 保存落盘核验（纯逻辑）===")
+    print("\n=== E. 保存落盘核验与占用释放（纯逻辑）===")
     with tempfile.TemporaryDirectory() as tmpdir:
         test_stat_sig(tmpdir)
+        print()
+        test_release_document(tmpdir)
 
     print("\n=== F. 字形级纠错与字体相似度（纯逻辑 + 合成图）===")
     test_as_mask()
@@ -957,6 +1439,19 @@ def main():
     test_word_aligned_iou()
     print()
     test_case_by_height()
+    print()
+    test_parse_region_fields()
+
+    print("\n=== G. 整图识别：调色板 / 分色 / 块 / 方向（合成图 + 纯逻辑）===")
+    test_detect_palette()
+    print()
+    test_color_space_direction()
+    print()
+    test_blocks_tight_bbox()
+    print()
+    test_orientation_votes()
+    print()
+    test_snap_box_to_ink()
 
     print()
     if _FAILED:

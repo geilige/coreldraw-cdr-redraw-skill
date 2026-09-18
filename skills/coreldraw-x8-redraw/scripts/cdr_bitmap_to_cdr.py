@@ -272,6 +272,36 @@ def auto_partition(src, color_img, min_ink_px=4, min_gap_px=6, min_run_px=6,
     return out, residue
 
 
+def region_gray(src, r):
+    """区域声明的颜色 -> 只含该色墨迹的灰度图；未声明则 None（用原始灰度）。"""
+    c = r.get("fill")
+    return src.ink_gray(c) if c else None
+
+
+def region_ink_level(src, r):
+    """该区域的**墨色基准灰度**（全图按色统计，不是区内统计）。
+
+    区内统计会高估：1.3mm 高的小字一个像素都没被完全覆盖，区内最暗只是
+    "60% 覆盖"，拿它当基准会把覆盖率整体高估、阈值被系统性选低。
+    """
+    c = r.get("fill")
+    return src.ink_level(c) if c else None
+
+
+def _load_scan_texts(path):
+    """读 cdr_scan_text.py 的 scan.json，取出文字条目。
+
+    只认 `texts`：`blocks` 是**该描摹**的部分，不属于排除范围。
+    """
+    import json as _json
+    with open(path, encoding="utf-8") as f:
+        d = _json.load(f)
+    texts = d.get("texts")
+    if texts is None:
+        raise ValueError(f"{path} 里没有 texts 字段——它是不是 scan.json？")
+    return texts
+
+
 def _type_of(r, src):
     """按形状与尺寸给区域猜一个语义类型（仅用于命名，可被 --region 覆盖）。"""
     if r.get("kind") == "band":
@@ -326,24 +356,37 @@ def pick_thresholds(px_area, thresholds, max_px):
 
 
 def tune_and_trace(src, r, args, log):
-    """对单个区域扫阈值，取 IoU 最高的组合，返回 (svg, subs, bbox, info)。"""
+    """对单个区域扫阈值，取**软 IoU** 最高的组合，返回 (thr, m, ts)。
+
+    **为什么用 soft 而不是 iou 选阈值**（真踩过，代价是小字全被切碎）：
+    `iou` 的参考掩膜固定按 128 二值化，与候选阈值无关，于是它天然偏向 128
+    ——阈值越低描摹越细，与 128 的参考越"像"，判据就把阈值一路压到最低档。
+    实测 `www.daiion.com`（1.36mm 高、笔画 1px）被选成 128 后，`w` 的斜画
+    断成碎片，渲染成 `ʍʍʍ dai ɔn com`；而 soft 判据选出 148（覆盖率 50%
+    等值线附近），笔画连通、可读。两套分数的方向甚至相反：
+        阈值 128  ->  iou 82.6%（最高）   soft 59.4%
+        阈值 148  ->  iou 71.2%          soft 73.0%（最高）
+    """
     y0, y1, x0, x1 = r["y0"], r["y1"], r["x0"], r["x1"]
     ts = max(1, args.turdsize * args.upscale ** 2)      # turdsize 单位是位图像素
     cands = ([args.threshold] if args.threshold
              else pick_thresholds((y1 - y0) * (x1 - x0),
                                   args.tune_list, args.max_tune_px))
     rows = []
+    gray = region_gray(src, r)
+    lvl = region_ink_level(src, r)
     for thr in cands:
         m = T.evaluate(src, y0, y1, x0, x1, r["invert"], args.upscale,
-                       ts, args.alphamax, args.opttolerance, threshold=thr)
+                       ts, args.alphamax, args.opttolerance, threshold=thr,
+                       gray=gray, ink_level=lvl)
         rows.append((thr, m))
-        log(f"      阈值 {thr:3d}  IoU {m['iou']:6.2f}%  召回 {m['recall']:6.2f}%  "
-            f"精确 {m['precision']:6.2f}%  面积比 {m['ink_ratio']:.3f}  "
-            f"曲线段 {m['svg'].count('C'):5d}")
+        log(f"      阈值 {thr:3d}  软IoU {m['soft']:6.2f}%  IoU {m['iou']:6.2f}%  "
+            f"召回 {m['recall']:6.2f}%  精确 {m['precision']:6.2f}%  "
+            f"面积比 {m['ink_ratio']:.3f}  曲线段 {m['svg'].count('C'):5d}")
     # alphamax=0 会让 potrace 输出纯多边形（圆角变折线），IoU 反而可能最高，
     # 所以先只在"有真实曲线段"的候选里选，全都退化时才退回全体。
     curved = [t for t in rows if t[1]["svg"].count("C") > 0]
-    thr, m = max(curved or rows, key=lambda t: t[1]["iou"])
+    thr, m = max(curved or rows, key=lambda t: t[1]["soft"])
     return thr, m, ts
 
 
@@ -362,19 +405,28 @@ def trace_all(src, regions, args, log):
     info = {}
     for r in regions:
         name = r["trace_name"]
+        gray = region_gray(src, r)
+        lvl = region_ink_level(src, r)
+        fill = ("#%02X%02X%02X" % tuple(r["fill"])) if r.get("fill") else "#111111"
+        # 空掩膜预检：没有显式阈值时用**覆盖率 50% 等值线**而不是 128。
+        # 128 对浅色/极细笔画可能一刀切空，于是整区被误判成"无内容"而跳过。
+        pre_thr = args.threshold or (
+            int(round((lvl + 255) / 2)) if lvl is not None else 128)
         fg = T.region_mask(src, r["y0"], r["y1"], r["x0"], r["x1"],
-                           r["invert"], args.upscale, args.threshold or 128)
+                           r["invert"], args.upscale, pre_thr, gray)
         if not fg.any():
             log(f"  {name:14s} 掩膜为空，跳过")
             continue
         log(f"  {name:14s} 源框 x {r['x0']:5d}..{r['x1']:5d}  "
-            f"y {r['y0']:5d}..{r['y1']:5d}  类型 {r['type']}")
+            f"y {r['y0']:5d}..{r['y1']:5d}  类型 {r['type']}"
+            + (f"  填色 {fill}" if r.get("fill") else ""))
         thr, m, ts = tune_and_trace(src, r, args, log)
         svg, subs, (mx0, my0, mx1, my1) = T.mask_to_svg(
             T.region_mask(src, r["y0"], r["y1"], r["x0"], r["x1"], r["invert"],
-                          args.upscale, thr),
+                          args.upscale, thr, gray),
             src.mm_per_px / args.upscale, r["x0"] * args.upscale,
-            r["y0"] * args.upscale, ts, args.alphamax, args.opttolerance)
+            r["y0"] * args.upscale, ts, args.alphamax, args.opttolerance,
+            fill=fill)
         path = os.path.join(args.svg_dir, f"{name}.svg")
         with open(path, "w", encoding="utf-8") as f:
             f.write(svg)
@@ -387,6 +439,8 @@ def trace_all(src, regions, args, log):
             "subpaths": len(subs),
             "type": r["type"],
             "threshold": thr,
+            # 填色写进清单：导入脚本据此给形状上色（多色稿的关键）
+            "fill": list(r["fill"]) if r.get("fill") else None,
             # kind/color 也记下来：满版色带的垫底矩形是从这里推出来的，
             # 报告重建（--report-only）时若清单里没有 rects 就能反推回去。
             "kind": r.get("kind"),
@@ -396,14 +450,21 @@ def trace_all(src, regions, args, log):
             "recall": m["recall"],
             "precision": m["precision"],
             "ink_ratio": m["ink_ratio"],
+            # soft 是选阈值用的口径（覆盖率软 IoU），比 iou 更能反映真实保真度；
+            # ink_level/coverage50 记下来便于复核"这个阈值合不合理"
+            "soft": m["soft"],
+            "ink_level": m["ink_level"],
+            "coverage50": m["coverage50"],
         }
         info[name] = {"type": r["type"], "threshold": thr, "subpaths": len(subs),
                       "bbox_mm": [round(mx0, 4), round(my0, 4),
                                   round(mx1, 4), round(my1, 4)],
                       "iou": m["iou"], "recall": m["recall"],
                       "precision": m["precision"], "ink_ratio": m["ink_ratio"],
+                      "soft": m["soft"],
                       "source_box_px": [r["x0"], r["y0"], r["x1"], r["y1"]]}
-        log(f"      -> 选中阈值 {thr}  IoU {m['iou']:.2f}%  面积比 {m['ink_ratio']:.3f}  "
+        log(f"      -> 选中阈值 {thr}（软IoU {m['soft']:.2f}%  参考阈值 "
+            f"{m['coverage50']:.0f}=覆盖率50%）  面积比 {m['ink_ratio']:.3f}  "
             f"子路径 {len(subs)}  包围盒 {mx1-mx0:.3f} x {my1-my0:.3f} mm")
     mp = os.path.join(args.svg_dir, "manifest.json")
     with open(mp, "w", encoding="utf-8") as f:
@@ -616,8 +677,10 @@ def build_parser():
     ap.add_argument("--page-size", default=None,
                     help="标准纸型 A4/A3/A5/Letter 或 宽x高；给定时覆盖上面两项的高度")
     ap.add_argument("--region", action="append", default=[],
-                    help="手工分区 name:x0,y0,x1,y1[,invert]（源图像素，左上原点），"
-                         "可重复；给出后不再自动分区")
+                    help="手工分区 name:x0,y0,x1,y1[,invert][,#RRGGBB]（源图像素，"
+                         "左上原点），可重复；给出后不再自动分区。"
+                         "**多色稿必须给颜色**：同一块区域按两种颜色各写一条，"
+                         "即按色分层描摹（两色掩膜互斥，不会重叠描两遍）")
     ap.add_argument("--rect", action="append", default=[],
                     help="手工追加垫底矩形 name:x,y,w,h,#RRGGBB（毫米，y 距页顶），可重复")
     ap.add_argument("--out-dir", default=None,
@@ -635,9 +698,27 @@ def build_parser():
     ap.add_argument("--opttolerance", type=float, default=0.1, help="曲线优化容差")
     ap.add_argument("--threshold", type=int, default=None,
                     help="固定二值化阈值；给定时不做逐区寻优")
-    ap.add_argument("--tune-thresholds", default="112,118,128,138,148",
-                    help="寻优候选阈值，逗号分隔（默认 112,118,128,138,148）。"
-                         "阈值越低笔画越细，细笔画文字对它很敏感")
+    ap.add_argument("--scan-json", default=None,
+                    help="cdr_scan_text.py 产出的 scan.json。给定后把识别到的"
+                         "**文字像素从描摹范围里挖掉**——文字由活字路径负责，"
+                         "留着就会被描成线（这正是"
+                         "\"先整幅描摹、事后补活字\"那个顺序的后果）")
+    ap.add_argument("--scan-pad", type=int, default=2,
+                    help="文字排除框的外扩像素数，默认 2。文字笔画外面还有一圈"
+                         "抗锯齿灰，按紧框挖会留下毛刺")
+    ap.add_argument("--scan-include-suspect", action="store_true",
+                    help="把 scan.json 里 suspect 的条目也挖掉。默认**不挖**："
+                         "它们多半是线稿被 OCR 误读，按框挖会在图形上开洞")
+    ap.add_argument("--allow-palette-mismatch", action="store_true",
+                    help="调色板与该色实测墨色不一致时照旧继续（默认中止）。"
+                         "不一致会让 CDR 填色偏，通常是调色板取自被抗锯齿拉浅的"
+                         "中位色，应改用实测墨色")
+    ap.add_argument("--tune-thresholds", default="112,128,139,148,160,172,184",
+                    help="寻优候选阈值，逗号分隔（默认 112,128,139,148,160,172,184）。"
+                         "阈值越低笔画越细，细笔画文字对它很敏感。"
+                         "**必须覆盖到覆盖率 50% 等值线附近**（黑墨约 139、"
+                         "洋红约 177）：低于它的阈值会把 1px 细笔画切成碎片。"
+                         "旧默认只到 148 且用二值 IoU 选阈值，实测把小字全选成了 128")
     ap.add_argument("--max-tune-px", type=int, default=200000,
                     help="源像素面积超过此值的区域只扫 3 个候选阈值以控时。"
                          "U=8 下一次大区域描摹要几十秒，5 档扫描会让整轮跑上十几分钟；"
@@ -901,6 +982,7 @@ def _run(args, log):
             name, d = T.parse_region(spec)
             d["kind"] = "content"
             d["name"] = name
+            d["manual"] = True          # 图层名用用户起的名字，别用猜出来的类型
             d["trace_name"] = name
             d["type"] = _type_of(d, src)
             d["trace_type"] = "INK" if d["invert"] else d["type"]
@@ -915,10 +997,53 @@ def _run(args, log):
                 f"下 {residue['bottom']} 行（仅用于分区判定，不影响描摹范围）")
         regions = name_regions(raw, src)
         log(f"  自动分区得到 {len(regions)} 个区域")
+    # 多色稿：区域声明的颜色汇成调色板。同一个区域按两种颜色各写一条，
+    # 就是"按色分层描摹"——两色的掩膜天然互斥，不会重叠描两遍。
+    palette = []
+    for r in regions:
+        c = r.get("fill")
+        if c and tuple(c) not in palette:
+            palette.append(tuple(c))
+    if palette:
+        src.palette = palette
+        log("  调色板 %d 色: %s（按色分离墨迹）" % (
+            len(palette), ", ".join("#%02X%02X%02X" % c for c in palette)))
+        # 核对调色板与该色**实际墨色**。踩过：调色板是从"该色像素的中位 RGB"
+        # 取的，中位被抗锯齿边缘拉浅——黑字真值 #1A1819，中位给出 #383637，
+        # 两者肉眼都是"黑"，于是 CDR 里整片黑填成了偏灰色，一路无人报错。
+        ok, lines = src.palette_check()
+        for ln in lines:
+            log(ln)
+        if not ok:
+            log("  [警告] 调色板与实测墨色不一致，CDR 的填色会偏。"
+                "请用上面「实测墨色」那一列重传 --palette")
+            if not args.allow_palette_mismatch:
+                log("  已中止（要照旧继续请加 --allow-palette-mismatch）")
+                return 2
+    # 4.5) 文字排除：把识别出的文字像素从描摹范围里**挖掉**
+    #
+    # 这一步是"先识别、再重绘"的落点。顺序反过来（先整幅描摹、事后补活字）
+    # 的后果实测有两个：产物里文字是曲线不是文本；而且**倒置的文字在正向
+    # OCR 里整块漏检**，连"这里本来有字"都看不出来。
+    if args.scan_json:
+        texts = _load_scan_texts(args.scan_json)
+        src.exclude = T.text_exclusion(texts, src.gray.shape, pad=args.scan_pad)
+        n_ex = sum(1 for t in texts
+                   if not (t.get('suspect') and not args.scan_include_suspect))
+        log("  文字排除：%d 条识别结果 -> %d 条参与挖空（外扩 %d px）"
+            % (len(texts), n_ex, args.scan_pad))
+        skipped = [t['text'] for t in texts
+                   if t.get('suspect') and not args.scan_include_suspect]
+        if skipped:
+            log("    跳过 suspect 项 %s —— 它们多半是线稿被 OCR 误读，"
+                "按框挖会在图形上开洞" % (", ".join(repr(s) for s in skipped)))
+
     for r in regions:
         log(f"    {r['name']:14s} {r['type']:5s} "
             f"x {r['x0']:5d}..{r['x1']:5d}  y {r['y0']:5d}..{r['y1']:5d}"
             + ("  [反白]" if r["invert"] else "")
+            + (f"  填色 #{r['fill'][0]:02X}{r['fill'][1]:02X}{r['fill'][2]:02X}"
+               if r.get("fill") else "")
             + (f"  垫底色 #{r['color'][0]:02X}{r['color'][1]:02X}{r['color'][2]:02X}"
                if r.get("kind") == "band" else ""))
 
@@ -931,9 +1056,12 @@ def _run(args, log):
     #    一个区域一个图层：X8 的 Layer.Import 把新形状插到图层底部而不是追加到
     #    末尾，图层里已有形状时取错对象会把属性写到旧形状上。让每个区域独占
     #    一层，导入时图层为空，索引就没有歧义。
-    rects, white, layer_order, layer_map = [], set(), [BAND_LAYER], {}
-    for i, r in enumerate(regions, 2):        # 01 号留给垫底矩形层
-        lname = f"{i:02d}_{r['trace_type']}"
+    rects, white, layer_map, layer_order = [], set(), {}, []
+    for i, r in enumerate(regions, 1):
+        # 手工分区用用户起的名字当图层名（多色稿一层一色，名字要能分辨）；
+        # 自动分区的名字本身就是从类型推出来的，直接用类型。
+        tag = r["name"] if r.get("manual") else r["trace_type"]
+        lname = f"{i:02d}_{tag}"
         layer_map[r["trace_name"]] = lname
         layer_order.append(lname)
         if r["invert"]:
@@ -947,6 +1075,9 @@ def _run(args, log):
     for spec in args.rect:
         name, rr = _parse_rect_mm(spec)
         rects.append((name, rr))
+    # 垫底矩形层只在真有矩形时才建，否则输出里会留一个空图层
+    if rects:
+        layer_order.insert(0, BAND_LAYER)
     log("")
     log(f"  图层（自下而上）: {layer_order}")
     log(f"  垫底矩形 {len(rects)} 个，反白填充区域 {sorted(white) or '无'}")

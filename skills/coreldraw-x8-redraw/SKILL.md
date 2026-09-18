@@ -1,6 +1,6 @@
 ---
 name: coreldraw-x8-redraw
-description: 给一张位图（PNG/JPG 设计稿、扫描件、包装稿导出图），自动操作 CorelDRAW 把它画成矢量图——标定、自动分区、逐区描摹、在 CDR 中建页建图层并精确定位、配准式像素校验，一条命令跑完。也支持源 CDR 剖析重建、PDF 派生、图片+尺寸参数化绘制，以及校验重建结果与源文件是否一致。Trigger keywords - CorelDRAW, CorelDRAW X8, CDR, 位图转矢量, 矢量化, 描摹, 自动绘制, 重绘, 复刻, 重建, redraw, rebuild, trace, vectorize, bitmap to vector, VGCore, pywin32。
+description: 给一张位图（PNG/JPG 设计稿、扫描件、包装稿导出图），自动操作 CorelDRAW 把它画成矢量图——先整图识别文字/符号/图形（含文字朝向与中英文 OCR），再把文字区判定为"转可编辑活字"或"保留描摹轮廓"，然后逐区描摹非文字部分、在 CDR 中建页建图层并精确定位、配准式像素校验，一条命令跑完。也支持源 CDR 剖析重建、PDF 派生、图片+尺寸参数化绘制，以及校验重建结果与源文件是否一致。Trigger keywords - CorelDRAW, CorelDRAW X8, CDR, 位图转矢量, 矢量化, 描摹, 自动绘制, 重绘, 复刻, 重建, 文字识别, 转活字, redraw, rebuild, trace, vectorize, bitmap to vector, OCR, live text, VGCore, pywin32。
 agent_created: true
 ---
 
@@ -12,6 +12,29 @@ agent_created: true
 
 用户给的是一张图（设计稿截图、扫描件、包装稿导出图、参考照片），要求"照着这张图在
 CorelDRAW 里画出来"——走下面的位图矢量化主线，一条命令跑完。
+
+> **⚠️ 图纸里有文字时，必须先识别文字，不能直接整张描摹。**
+> 直接描摹会把文字也描成轮廓曲线：**看着像，但不可编辑、不可改字、换不了字体**，
+> 等于把可编辑内容降级成了死图形。用户明确要求过这一点
+> （"没有第一时间识别文字 中英文 导致有些文字也是描线的 就不对"、
+> "第一步应该是识别图片中的文字和符号"）。
+>
+> 正确顺序是**识别在前、描摹在后**，且两者范围互斥：
+>
+> | 步骤 | 脚本 | 作用 |
+> | --- | --- | --- |
+> | 1 | `cdr_scan_text.py` | **整图识别**：文字、符号、图形块，以及每块文字的朝向（0° / 180°） |
+> | 2 | `cdr_text_live.py` | 逐区判定 `convert`（转活字）/ `keep_trace`（保留描摹），只判定不写 |
+> | 3 | `cdr_bitmap_to_cdr.py` | 描摹 **非文字块 + keep_trace 的文字区** |
+> | 4 | `cdr_text_live.py --apply` | 把 `convert` 的文字建成可编辑文本 |
+>
+> 关键是**第 3 步的描摹范围要包含 `keep_trace` 的文字区**。漏掉它，品牌字标、
+> 特殊符号就会整个从成品里消失（踩过：`daiion` 字标和 `4#` 都不见了）。
+> 而 `--scan-json` 挖除清单只能喂 `convert` 的，喂全量会把 `keep_trace` 的字标一起挖掉。
+>
+> 判定为 `keep_trace` 不等于失败——**字库里没有接近的字体时，保留描摹轮廓才是对的**。
+> 实测 `daiion` 是定制品牌字标（首字母高度等于 x-height，扫遍字体库无一款如此），
+> 强行套 Arial Bold（IoU 0.60）反而是降级。此时必须在报告里说明原因。
 
 ## 快速开始（一条命令）
 
@@ -421,6 +444,21 @@ python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cd
 - **`SaveAs` / `Export` 会按 CorelDRAW 自己的工作目录解析相对路径**，
   必须先把输出路径转成绝对路径，否则文件会落到意外位置。
 - 新建文档自带"图层 1"，直接改名复用，否则会多出一个空图层。
+- **文件被 CorelDRAW 自己打开时，`SaveAs` / `Save()` 会静默变成空操作**——
+  不抛异常、不写盘，日志照常打印"已保存"。而**占用往往就是自动化自己造成的**：
+  `cdr_common.open_document()` 刻意"只开不关"（把成果留在窗口里给用户接着改），
+  于是下一轮重建同一个文件时目标被上一轮的文档占着，`os.replace` 抛
+  `PermissionError [WinError 32]`。
+  修法：重写目标前先调 `cdr_common.release_document(path)`（只关路径匹配的那一个，
+  `Dirty=True` 时拒绝关闭），保存前后再用 `cdr_common.file_fingerprint()`
+  比对 `(大小, mtime_ns)` 确认真的落盘了。
+  指纹没变但文件**能**独占打开时按成功处理——那是"本次保存无内容可写"，不是故障。
+- **不要为了"让文件存在检查有意义"而先删旧文件。** 受限运行环境会把 `os.remove`
+  判为批量删除并**直接掐掉进程**：日志里只剩一行 `SAFE_DELETE_BULK_CONFIRM_REQUIRED`，
+  整条流水线莫名 `EXIT=1`，而 CDR 其实已经保存好了，极易误判成保存失败。
+  用**改名归档**（`os.replace(f, f+'.bak')`）或**指纹比对**替代删除。
+- `BoundingBox` 返回的是 **`IVGRect` 对象，不是元组**，不能下标取；
+  用 `.Left/.Right/.Bottom/.Top/.Width/.Height`。
 
 ## 源数据提取
 
@@ -496,6 +534,39 @@ python scripts\cdr_visual_diff.py --source ref.png ^
 
 产出整页 IoU / 召回 / 精确、分区域指标、差异叠加图与放大对照图。
 
+### 整图识别（流水线第一步）
+
+`scripts/cdr_scan_text.py` —— 一张图里"哪些是文字、哪些是符号、哪些是图形"：
+
+```text
+python scripts\cdr_scan_text.py --image ref.png --out-dir out\scan ^
+  --mm-per-px 0.17256 --emit-live out\live_regions.txt --emit-trace out\trace_regions.txt
+```
+
+产出 `scan.json`（逐条：框、文本、朝向、置信度、是否可疑）、`scan_preview.png`
+（彩色框预览：蓝=正置文字、橙=180° 文字、红=图标、绿=实心块、黄=混合块），
+以及两份可直接喂下游的区域清单：
+
+| 清单 | 格式 | 喂给 |
+| --- | --- | --- |
+| `--emit-live` | `NAME=y0,y1,x0,x1[,#RRGGBB][,rot=180]`（**y 在前**） | `cdr_text_live.py --region` |
+| `--emit-trace` | `name:x0,y0,x1,y1[,#RRGGBB]`（**x 在前、冒号分隔**） | `cdr_bitmap_to_cdr.py --region` |
+
+> 两份清单格式不同是历史原因（一个按行优先、一个按列优先），**别手抄**——
+> 手抄两份必然不同步。流水线里由 `build_all.py` 从同一份 `scan.json` 派生。
+
+它解决的几个具体问题：
+
+- **调色板自动提取。** 抗锯齿像素是"背景色 → 墨色"的线性混合，所以按
+  **方向**（不是欧氏最近色）聚类才能得到精确墨色。用最近色会把黑字的灰边判给
+  洋红；用"最暗 5%"会被两色交界的混色带偏（实测拿到 `#383637`，真值是 `#1A1819`）。
+- **文字朝向判定。** OCR 对长文本的方向不敏感，必须用**渲染字形的 IoU** 复核
+  0° / 180°。上排整体倒置的标签就是靠这个才读得出来。
+- **文字框吸附。** OCR 给的是紧框，会切掉相连的笔画（实测倒置字标的 `i` 点
+  在 y529..535、OCR 框只到 y531）。`snap_box_to_ink` 把框扩到**与之相连**的
+  墨迹边界——是连通分量判定，不是"附近有墨迹就长"，所以不会吞掉相邻元素。
+- **块分类。** `solid` / `line_art` / `icon` / `mixed` 决定描摹参数与图层命名。
+
 ### 文字转活字（可选，独立一步）
 
 `scripts/cdr_text_live.py` —— 识别文字 + 匹配字体 + 判定能否转成真文本：
@@ -538,11 +609,25 @@ python scripts\cdr_text_live.py --image ref.png ^
 > 但 `lift` 2.675→**1.68**（中位候选也一起抬高了）；`rebuild_iou` 必须与
 > `match_fonts` 同源，否则 lift 是废数。
 
-> **⚠️ 用 `--apply` 之前，务必确认目标 CDR 没有被别的程序打开**
-> （最常见就是**用户自己开着 CorelDRAW 在看这个文件**）。
-> 文件被占用时是只读的，`doc.Save()` 会**静默变成空操作**——日志照常打印
-> "已保存"，盘上却什么都没变。脚本现在会在保存后比对文件指纹，
-> 没落盘就报错并返回**退出码 3**；看到 3 就是"关掉那个文件再跑一遍"。
+> **⚠️ 重写目标 CDR 之前必须解除 CorelDRAW 的占用。**
+> 文件被占用时是只读的，`SaveAs` / `Save()` 会**静默变成空操作**——日志照常
+> 打印"已保存"，盘上却什么都没变；而改名/删除则直接抛
+> `PermissionError [WinError 32]`。
+>
+> 麻烦的是**占用往往是自动化自己造成的**：`cdr_text_live.py --apply` 走
+> `cdr_common.open_document()`，刻意"只开不关"（把成果留在 CorelDRAW 窗口里
+> 让用户接着改）。于是**下一轮**重建时目标被上一轮留下的文档占着，
+> 流水线在第 3 步前就死，报错还只是个 WinError 32。
+>
+> 现在的做法：`cdr_image_place.py` 在 `SaveAs` 之前、流水线在归档旧文件之前，
+> 都先调 `cdr_common.release_document()` 把目标关掉。该函数**只关路径匹配的
+> 那一个文档**（按绝对路径规范化比对，同名不同目录不会误伤），且
+> **`Dirty=True` 时拒绝关闭**——那种改动是用户的，不能替用户丢。
+> 释放失败会明确报错退出，不再静默往下跑。
+>
+> 落盘核验仍然是最后一道闸：保存前后各取一次 `(大小, mtime_ns)` 指纹，
+> 没变就报错并返回**退出码 3**。指纹没变但文件**能**独占打开时按成功处理
+> （那是"本次保存无内容可写"，不是故障）。
 
 ### CDR 剖析与重建
 
@@ -558,7 +643,7 @@ python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cd
 ```text
 python -m pip install numpy opencv-python pillow potracer
 python -m pip install pywin32          # 只有要建 CDR 时才需要
-python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线回归测试（115 项断言）
+python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线回归测试（196 项断言）
 ```
 
 文字转活字另需 OCR（离线，无需联网）：
@@ -583,14 +668,18 @@ Windows 上 `onnxruntime` 还缺 `vcruntime140_1.dll` 与 `msvcp140_1.dll`
 > 再确认依赖装在了哪个。**跑脚本时始终用装了依赖的那个绝对路径**，
 > 不要依赖 `PATH` 里的 `python`。
 
-`selftest_offline.py` 覆盖六块：纯逻辑（提示词渲染、CDR 结构比对）；
+`selftest_offline.py` 覆盖七块：纯逻辑（提示词渲染、CDR 结构比对）；
 **用一张几何已知的合成图**验证自动分区的每一处坑（残留剥离、外沿外扩、
 满版色带贯通判据、行中位数、列方向切分、超采样度量的偏差量级）；
 文字转活字的判定（连通分量、文字/线稿的统计特征、四条判据的边界）；
 OCR 的预处理与变体选择（Otsu 平台期、二值化极性、变体选择规则）；
-保存落盘核验的文件指纹（写了必须变、没写必须不变）；
+保存落盘核验与**占用释放**（文件指纹写了必须变、没写必须不变；
+`release_document` 按绝对路径匹配、同名不同目录不误伤、
+**`Dirty=True` 必须拒绝关闭**）；
 **字形级纠错与字体相似度**（灰度/布尔切段必须一致、逐词对齐不受整行相位影响、
-字高判据正反两向 + 五条安全约束 + 传字符串必须抛错）。
+字高判据正反两向 + 五条安全约束 + 传字符串必须抛错）；
+**整图识别**（调色板按方向聚类不被抗锯齿拆成假色、按色分离不串色、
+块包围盒是紧框、文字朝向判定、OCR 框吸附相连笔画但不吞相邻元素）。
 **夹具全部用实测值而不是编的数**——包括那张"置信度会选错"的变体表。
 
 改动 `auto_partition` / `strip_residue` / `_tighten` / `rasterize` /

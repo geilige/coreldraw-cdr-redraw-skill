@@ -106,7 +106,7 @@ python skills\coreldraw-x8-redraw\scripts\cdr_bitmap_to_cdr.py ^
 | 易碎标 | 152.539,59.532..194.988,75.924 | 152.474,59.596..195.074,75.924 |
 | 页脚 | 81.274,186.878..145.292,189.121 | 81.252,186.921..145.249,189.703 |
 
-这套判据有**离线回归测试**（`scripts/selftest_offline.py`，115 项断言，不需要
+这套判据有**离线回归测试**（`scripts/selftest_offline.py`，196 项断言，不需要
 CorelDRAW）：用一张几何已知的合成图覆盖残留剥离、外沿外扩、贯通判据、
 行中位数、列切分、超采样度量等每一处坑，改坏了立刻报出来。
 
@@ -176,8 +176,24 @@ X8 内置 PowerTRACE 的宏接口**能跑**，但质量差一个量级，所以�
 
 ## 文字能不能转成可编辑的活字
 
-能，而且比"中心线瘦身"更彻底。实测 vonder 页脚那行 6pt 文字：
+> **⚠️ 图纸里有文字时，顺序必须是「先识别、后描摹」，不能反过来。**
+> 直接整张描摹会把文字也描成轮廓曲线：**看着像，但不可编辑、改不了字、换不了字体**。
+>
+> ```
+> 1. cdr_scan_text.py          整图识别：文字 / 符号 / 图形块 + 每块文字朝向
+> 2. cdr_text_live.py          逐区判定 convert / keep_trace（只判定，不写）
+> 3. cdr_bitmap_to_cdr.py      描摹【非文字块 + keep_trace 的文字区】
+> 4. cdr_text_live.py --apply  把 convert 的文字建成可编辑美术字
+> ```
+>
+> 第 3 步的范围**必须包含 `keep_trace` 的文字区**。漏掉它，品牌字标和特殊符号
+> 会整个从成品里消失（实测：`daiion` 字标、`4#` 都没了）。
+>
+> 判定为 `keep_trace` **不等于失败**——字库里没有接近的字体时，保留描摹轮廓才是对的。
+> 实测 `daiion` 是定制品牌字标（首字母高度等于 x-height，扫遍字体库无一款如此），
+> 强行套 Arial Bold 反而是降级。
 
+能，而且比"中心线瘦身"更彻底。实测 vonder 页脚那行 6pt 文字：
 - 识别出 `O.V.D. Importadora e Distribuidora Ltda. • Curitiba - PR`
 - 字体匹配到 **Swis721 Cn BT / Bold**，逐词对齐 IoU **0.7235**，领先候选集中位 **1.68 倍**
 - 重建为 **1 个文本对象**，文字可编辑；而描摹轮廓是 73 子路径 / 840 段
@@ -399,7 +415,7 @@ python skills\coreldraw-x8-redraw\scripts\cdr_redraw.py ^
   --source input.cdr --output outputs\redraw_exact.cdr --mode clone
 ```
 
-**离线回归测试**（不需要 CorelDRAW，115 项断言）：
+**离线回归测试**（不需要 CorelDRAW，196 项断言）：
 
 ```powershell
 python skills\coreldraw-x8-redraw\scripts\selftest_offline.py
@@ -418,14 +434,15 @@ skills/coreldraw-x8-redraw/
 ├── SKILL.md                          技能定义与完整流程
 ├── scripts/
 │   ├── cdr_bitmap_to_cdr.py          ★ 主入口：位图 → CDR 一条命令
+│   ├── cdr_scan_text.py              ★ 整图识别：文字/符号/图形块 + 文字朝向
 │   ├── cdr_image_trace.py            标定 + 分区 + 描摹 + 参数寻优
 │   ├── cdr_image_place.py            按清单在 CorelDRAW 中重建
 │   ├── cdr_visual_diff.py            配准式像素校验
 │   ├── cdr_text_live.py              文字识别 + 字体匹配 → 转可编辑活字
 │   ├── cdr_prompt_builder.py         生成文件专属重绘提示词
 │   ├── cdr_redraw.py                 形状级精确重建与结构校验
-│   ├── cdr_common.py                 COM 连接、重试、遍历、统计
-│   └── selftest_offline.py           离线回归测试（115 项断言，含自动分区合成图、活字判定、OCR 预处理）
+│   ├── cdr_common.py                 COM 连接、重试、遍历、统计、占用释放
+│   └── selftest_offline.py           离线回归测试（196 项断言，含自动分区合成图、整图识别、活字判定、OCR 预处理、占用释放）
 └── references/
     ├── raster-to-vector-notes.md     ★ 位图矢量化必读（实测踩坑结论）
     │                                 §9 = 内置 PowerTRACE 完整实测

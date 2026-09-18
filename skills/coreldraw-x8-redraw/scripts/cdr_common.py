@@ -208,6 +208,107 @@ def create_document(app):
     return doc
 
 
+def attach_coreldraw(progids=None):
+    """附加到**已在运行**的 CorelDRAW，返回 app；失败返回 None。
+
+    两个都必须试，只试前者会误判成"没有实例"：
+
+    - `GetActiveObject` 走 ROT。**用户手动启动的 CorelDRAW 不在 ROT 里**，
+      所以这里会抛 `-2147221021 操作无法使用`（实测 X8 必现）。
+    - `Dispatch` 走 CLSID 解析，手动启动的实例往往仍能附加上去。
+
+    与 `connect_coreldraw()` 的区别：本函数不设置 Visible/Optimization，
+    不改变用户正在看的窗口状态，适合"只想查一下/关一个文档"的轻量场景。
+    """
+    if progids is None:
+        progids = (X8_PROGID, DEFAULT_PROGID)
+    pythoncom.CoInitialize()
+    for progid in progids:
+        try:
+            return win32com.client.Dispatch(progid)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def find_open_document(app, path):
+    """在 app 已打开的文档里按**绝对路径**找 `path`，找不到返回 None。
+
+    路径比对必须用绝对路径：CorelDRAW 的 `Name` 只有文件名，不同目录的同名
+    文件会互相误伤；`FilePath` 末尾带反斜杠、大小写也不固定，所以两边都
+    规范化后再比。
+    """
+    import os  # noqa: PLC0415
+
+    target = os.path.abspath(str(path)).lower()
+    try:
+        count = com_retry(lambda: app.Documents.Count)
+    except Exception:  # noqa: BLE001
+        return None
+    for index in range(1, count + 1):
+        try:
+            doc = com_retry(lambda i=index: app.Documents.Item(i))
+        except Exception:  # noqa: BLE001
+            continue
+        full = str(safe_get(doc, "FullFileName", "") or "")
+        if not full:
+            full = "%s%s" % (safe_get(doc, "FilePath", "") or "",
+                             safe_get(doc, "Name", "") or "")
+        if os.path.abspath(full).lower() == target:
+            return doc
+    return None
+
+
+def release_document(path, allow_dirty: bool = False):
+    """把 `path` 从 CorelDRAW 里关掉，解除它对磁盘文件的占用。
+
+    为什么需要这个函数 —— 自动化流水线是**反复重写同一个 CDR** 的：
+
+    1. `open_document()` 刻意"只开不关"（跑完把成果留在 CorelDRAW 窗口里，
+       用户能直接接着改），于是**下一轮**重建时目标就被自己上一轮留下的
+       文档占着；
+    2. 文件被占用时 `SaveAs` / `Save` 会**静默失败** —— 不抛异常、不写盘，
+       日志照常打印"已保存"，只有磁盘没变（内存里改动都在，回读内存核验
+       还全对）。这是最难查的一类故障；
+    3. 改名/删除则是直接抛 `PermissionError [WinError 32]`。
+
+    返回 `(ok: bool, reason: str)`。`allow_dirty=False` 时，文档有未保存
+    改动就**拒绝关闭** —— 那种改动是用户的，不能替用户丢掉。
+    """
+    import os  # noqa: PLC0415
+
+    if not os.path.exists(str(path)):
+        return False, "文件不存在"
+    app = attach_coreldraw()
+    if app is None:
+        return False, "无法附加到 CorelDRAW"
+    doc = find_open_document(app, path)
+    if doc is None:
+        return False, "未在 CorelDRAW 中打开"
+    if bool(safe_get(doc, "Dirty", False)) and not allow_dirty:
+        return False, "文档有未保存改动（Dirty=True），拒绝关闭以免丢数据"
+    try:
+        com_retry(lambda: doc.Close(), attempts=10, delay=0.5)
+    except Exception as exc:  # noqa: BLE001
+        return False, "关闭失败：%s" % exc
+    return True, "已关闭"
+
+
+def file_fingerprint(path):
+    """返回 `(大小, mtime_ns)`；文件不存在返回 None。
+
+    用于**跨进程落盘操作的写前写后比对**：CDR 被别的进程占用时保存会静默
+    失败，只有指纹变了才说明真的写进磁盘了。
+    """
+    import os  # noqa: PLC0415
+
+    try:
+        st = os.stat(str(path))
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
 # ---------------------------------------------------------------------------
 # 遍历
 # ---------------------------------------------------------------------------

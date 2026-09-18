@@ -50,9 +50,14 @@ from PIL import Image
 
 
 class Source:
-    """参考图 + 页面标定。"""
+    """参考图 + 页面标定。
 
-    def __init__(self, path, page_w_mm, page_h_mm=None):
+    palette 给定时（一组 (r,g,b)），可用 ink_gray() 得到"只含某一种颜色墨迹"
+    的灰度图——**多色设计稿必须走这条路**：描摹管线本身只认灰度阈值，
+    一张两色图直接描会把两种颜色糊成一个色。
+    """
+
+    def __init__(self, path, page_w_mm, page_h_mm=None, palette=None):
         self.path = path
         self.gray = np.array(Image.open(path).convert("L"))
         self.img_h, self.img_w = self.gray.shape
@@ -61,6 +66,143 @@ class Source:
         self.page_h_mm = (float(page_h_mm) if page_h_mm
                           else self.img_h * self.mm_per_px)
         self.page_h_mm_derived = self.img_h * self.mm_per_px
+        self.palette = [tuple(int(v) for v in c) for c in (palette or [])]
+        self._rgb = None
+        self._cls = None
+        # "不许描摹"的整图掩膜（原生分辨率）。由 text_exclusion() 从
+        # 识别结果建出来，region_mask() 会自动应用它。
+        self.exclude = None
+
+    # -- 多色分离 ----------------------------------------------------------
+    def _classify(self):
+        """把每个像素归到某个调色板色（或背景）。返回 (标签图, 调色板)。
+
+        **判据是"方向角"，不是 RGB 距离。** 这点很关键：抗锯齿产生的
+        中性灰（黑字边缘）在 RGB 距离下离洋红比离黑更近——实测 50% 黑
+        (155,155,155) 到洋红 120、到黑 173，会被误判成洋红，于是在洋红
+        图层里沿黑字长出一圈灰晕。改成比"白→该色"的方向后：
+        黑字边缘的 v=255-p 是中性方向，与"白→黑"几乎平行（夹角 1.8°），
+        与"白→洋红"差 25°，归黑，不再漏到洋红。
+
+        几何含义：p 是 c 与白的混合 ⟺ v=255-p 与 d=255-c 平行。
+        所以方向角判据正好就是"这个像素是不是该色与白的混合"，
+        比距离判据贴合得多，而且对压缩噪声不敏感。
+        """
+        if self._cls is None:
+            if self._rgb is None:
+                self._rgb = np.array(Image.open(self.path).convert("RGB"))
+            pal = self.palette + [(255, 255, 255)]
+            v = 255.0 - self._rgb.astype(np.float32)      # 从白指向该像素
+            nv = np.linalg.norm(v, axis=2)
+            bg = len(pal) - 1
+            best = np.full(v.shape[:2], bg, np.int16)
+            best_cos = np.full(v.shape[:2], -1.0, np.float32)
+            for i, c in enumerate(pal[:bg]):
+                d = 255.0 - np.asarray(c, np.float32)     # 白 -> 该色
+                nd = float(np.linalg.norm(d))
+                if nd < 1e-6:
+                    continue
+                cos = (v * d).sum(axis=2) / np.maximum(nv * nd, 1e-6)
+                cos = np.where(nv < 1e-3, -1.0, cos)      # 纯白不归任何色
+                # 夹角超过 45° 就不认：给"不属于任何声明色"的杂色留个出口，
+                # 否则暗杂色会被硬塞给某个方向最接近的色、在图上多出墨点。
+                cos = np.where(cos < 0.707, -1.0, cos)
+                take = cos > best_cos
+                best = np.where(take, i, best)
+                best_cos = np.where(take, cos, best_cos)
+            self._cls = (best, pal)
+        return self._cls
+
+    def ink_gray(self, rgb):
+        """返回"只把该颜色的像素当墨迹"的灰度图（其余像素置白）。
+
+        归属见 _classify()。两色互斥，所以同一块区域按两种颜色各描一次
+        不会重复出图形；而且沿白↔色连线的混叠像素，其归属边界恰好落在
+        覆盖率 50%，与二值化阈值 128 是同一点，上采样后的边缘抗锯齿
+        照样保留，不会退化成硬边。
+        """
+        idx, pal = self._classify()
+        want = tuple(int(v) for v in rgb)
+        target = None
+        for i, c in enumerate(pal):
+            if c == want:
+                target = i
+                break
+        if target is None:
+            raise ValueError(f"颜色 {want} 不在调色板 {pal[:-1]} 里")
+        return np.where(idx == target, self.gray, 255).astype(np.uint8)
+
+    def ink_level(self, rgb):
+        """该色**完全覆盖**时的灰度值（全图 1% 分位）。
+
+        为什么不能用单区自己的分位：像 1.3mm 高的小字，一个像素都没被完全
+        覆盖，区内最暗的灰度可能是"60% 覆盖"而不是"100% 覆盖"。拿它当基准
+        会把覆盖率整体高估，阈值被系统性选低（实测小字区自估 75、全图真值 22）。
+        所以基准必须**按颜色在全图统计**——同一种墨色在大色块里总有完全覆盖
+        的像素，那个灰度才是该色的真值。
+        """
+        if not hasattr(self, "_ink_lvl"):
+            self._ink_lvl = {}
+        key = tuple(int(v) for v in rgb)
+        if key not in self._ink_lvl:
+            g = self.ink_gray(key)
+            ink = g[g < 250]
+            self._ink_lvl[key] = (float(np.percentile(ink, 1)) if len(ink)
+                                  else 0.0)
+        return self._ink_lvl[key]
+
+    def coverage(self, rgb, y0=None, y1=None, x0=None, x1=None):
+        """把灰度线性映射成**墨迹覆盖率** 0..1。
+
+        源图是抗锯齿的：`gray = ink·g_ink + (1-ink)·255`，所以
+        `覆盖率 = (255-gray)/(255-g_ink)`。这条式子是后面一切的地基——
+        **二值化只是覆盖率在某个阈值处切一刀**，而"哪一刀对"取决于笔画宽度：
+        粗笔画怎么切都差不多，1px 的细笔画切低了就断成碎片。
+
+        物理上正确的切线是覆盖率 50% 处，即 `(g_ink+255)/2`；对实测的
+        黑墨 g_ink=22 是 139、洋红 g_ink=98 是 177。
+        """
+        g = self.ink_gray(rgb)
+        if y0 is not None:
+            g = g[y0:y1, x0:x1]
+        lvl = self.ink_level(rgb)
+        if lvl >= 254:
+            return np.zeros(g.shape, np.float32)
+        return np.clip((255.0 - g.astype(np.float32)) / (255.0 - lvl), 0, 1)
+
+    def palette_check(self, tol=12):
+        """核对给定调色板与该色**实际墨色**是否一致，返回 (ok, 报告行)。
+
+        踩过：多色稿的调色板是从"该色像素的中位 RGB"取的，而中位被抗锯齿
+        边缘拉浅——实测黑字真值 `#1A1819`，中位给出 `#383637`。两者肉眼看
+        都是"黑"，于是 CDR 里整片黑都填成了偏灰的色，**一路无人报错**。
+        所以调色板必须与全图众数比对，偏了就要吵。
+        """
+        if self._rgb is None:
+            self._rgb = np.array(Image.open(self.path).convert("RGB"))
+        lines, ok = [], True
+        for c in self.palette:
+            g = self.ink_gray(c)
+            ink = self._rgb[g < 250]
+            if not len(ink):
+                lines.append(f"  #{c[0]:02X}{c[1]:02X}{c[2]:02X}  图里找不到该色的像素")
+                ok = False
+                continue
+            # 取该色像素的**众数**。不能用"最暗的一撮"：两色交界处的抗锯齿
+            # 混色比两色都暗（实测洋红 #C62F7C 与黑 #1A1819 的 50% 混合是
+            # #6A1F46，比两者都暗），按"最暗"取样会抓到交界而不是墨色本身。
+            # 完全覆盖的像素数量远多于任何单个混色，所以众数才是墨色。
+            vals, cnts = np.unique(ink, axis=0, return_counts=True)
+            mode = tuple(int(v) for v in vals[cnts.argmax()])
+            d = max(abs(mode[i] - c[i]) for i in range(3))
+            flag = "OK " if d <= tol else "!! "
+            if d > tol:
+                ok = False
+            lines.append(f"  {flag}#{c[0]:02X}{c[1]:02X}{c[2]:02X}  "
+                         f"实测墨色 #{mode[0]:02X}{mode[1]:02X}{mode[2]:02X}  "
+                         f"最大分量差 {d}"
+                         + ("  ← 调色板偏了，CDR 会填错色" if d > tol else ""))
+        return ok, lines
 
     def describe(self):
         lines = [
@@ -96,13 +238,23 @@ def probe_edges(src):
     return rep
 
 
-def region_mask(src, y0, y1, x0, x1, invert=False, upscale=1, threshold=128):
+def region_mask(src, y0, y1, x0, x1, invert=False, upscale=1, threshold=128,
+                gray=None, exclude=None):
     """取区域灰度（可上采样）并二值化。返回 True = 要描摹的墨迹。
 
     threshold 越低，算作墨迹的像素越少 → 笔画越细；越高越粗。
     细笔画文字（6pt 级）对阈值很敏感，值得用 --probe 扫一遍。
+
+    gray 给定时用它代替 src.gray —— 多色图按 Source.ink_gray(颜色) 传进来，
+    区域里就只剩该颜色的墨迹。
+
+    `exclude`（默认取 `src.exclude`）是**整图原生分辨率的"不许描摹"掩膜**，
+    由 `text_exclusion()` 从识别结果建出来。这是"先识别、再重绘"里
+    关键的一刀：文字已由活字路径负责，留在这里就会被描成线——
+    那正是"文字被描线"这个问题的来源。挖空后区域可能变空，
+    调用方按"掩膜为空"跳过即可，不需要额外分支。
     """
-    sub = src.gray[y0:y1, x0:x1]
+    sub = (src.gray if gray is None else gray)[y0:y1, x0:x1]
     if upscale > 1:
         sub = np.array(Image.fromarray(sub).resize(
             (sub.shape[1] * upscale, sub.shape[0] * upscale), Image.LANCZOS))
@@ -115,7 +267,35 @@ def region_mask(src, y0, y1, x0, x1, invert=False, upscale=1, threshold=128):
         for lb in edge:
             if lb != 0:
                 fg[labels == lb] = False
+    ex = src.exclude if exclude is None else exclude
+    if ex is not None:
+        e = ex[y0:y1, x0:x1]
+        if upscale > 1:
+            # 最近邻重复，保证"挖掉的范围"与原生像素网格严格对齐；
+            # 这里用 LANCZOS 会引入半透明过渡，反而留下毛边
+            e = np.repeat(np.repeat(e, upscale, axis=0), upscale, axis=1)
+        fg = fg & ~e[:fg.shape[0], :fg.shape[1]]
     return fg
+
+
+def text_exclusion(texts, shape, pad=2, include_suspect=False):
+    """把识别出的文字框（含抗锯齿外沿）做成"不许描摹"的掩膜。
+
+    `pad` 外扩是必须的：文字笔画外面还有一圈覆盖率 50% 上下的抗锯齿灰，
+    按紧框挖会留下 1~2px 残边，描出来就是一圈毛刺。
+
+    `suspect` 项默认**不挖**：它是 OCR 在线稿上凑出来的假文字
+    （本图那个 `ft` 就在运输图标里面），按它挖会在图标上开个洞。
+    """
+    h, w = shape
+    m = np.zeros((h, w), bool)
+    for t in texts:
+        if t.get('suspect') and not include_suspect:
+            continue
+        x0, y0, x1, y1 = [int(round(v)) for v in t['box']]
+        m[max(0, y0 - pad):min(h, y1 + pad + 1),
+          max(0, x0 - pad):min(w, x1 + pad + 1)] = True
+    return m
 
 
 # ----------------------------------------------------------------------------
@@ -131,12 +311,29 @@ def _xy(p):
 
 
 def _collect(curve, ox, oy, s, subs):
+    """把一条 potrace 曲线写成 SVG 子路径。
+
+    **角点段必须输出两个 L，不是一。** potrace 的曲线表示里，段 j 的
+    `c[1]` 是多边形顶点 `v_j`、`c[2]` 是**下一条边的中点**
+    `mid(v_j, v_{j+1})`（见 potracer `_smooth`：`c[1]=vertex`、
+    `c[2]=p4=interval(1/2, vertex[k], vertex[j])`）。所以一条角点段
+    是"经过顶点、到下一个中点"的折线，写成一个 `L c[2]` 就等于
+    **把顶点整个切掉**。
+
+    为什么以前没暴露：potrace 的多边形顶点通常密到 ~1px 一个，
+    切掉顶点只损失不到 1px，肉眼与 IoU 都看不出来。但**顶点稀疏的
+    简单形状**（实心矩形只有 4 个顶点）会被切成菱形——实测一个
+    174x217 的实心矩形，只写 `L c[2]` 时召回只剩 **75%**，
+    且无论怎么调阈值都救不回来（这是几何错误，不是参数问题）。
+    """
     px, py = _xy(curve.start_point)
     d = [f"M{(px + ox) * s:.4f},{(py + oy) * s:.4f}"]
     for seg in curve.segments:
         ex, ey = _xy(seg.end_point)
         x, y = (ex + ox) * s, (ey + oy) * s
         if seg.is_corner:
+            vx, vy = _xy(seg.c)          # c[1] = 多边形顶点
+            d.append(f"L{(vx + ox) * s:.4f},{(vy + oy) * s:.4f}")
             d.append(f"L{x:.4f},{y:.4f}")
         else:
             c1x, c1y = _xy(seg.c1)
@@ -149,11 +346,15 @@ def _collect(curve, ox, oy, s, subs):
         _collect(child, ox, oy, s, subs)
 
 
-def mask_to_svg(fg, mm_per_px, ox_px, oy_px, turdsize, alphamax, opttolerance):
+def mask_to_svg(fg, mm_per_px, ox_px, oy_px, turdsize, alphamax, opttolerance,
+                fill="#111111"):
     """掩膜 -> SVG 文本。ox_px/oy_px 为该掩膜左上角在整页像素坐标中的原点。
 
     包围盒直接由前景掩膜算，精确可靠；SVG 的 width/height/viewBox 全部取自它，
     这样 CorelDRAW 导入后尺寸天然正确。
+
+    fill 决定导入 CorelDRAW 后的填充色——多色稿一个区域一种色，
+    直接写在 SVG 里，省得导入后再逐个改。
     """
     path = potrace.Bitmap(~fg).trace(          # 坑 1：必须取反
         turdsize=turdsize, alphamax=alphamax,
@@ -175,7 +376,7 @@ def mask_to_svg(fg, mm_per_px, ox_px, oy_px, turdsize, alphamax, opttolerance):
         f'width="{wmm:.4f}mm" height="{hmm:.4f}mm" '
         f'viewBox="{mx0:.4f} {my0:.4f} {wmm:.4f} {hmm:.4f}">\n'
         # 坑 2/3：evenodd 还原镂空；子路径用空格分隔
-        f'<path fill="#111111" fill-rule="evenodd" d="{" ".join(subs)}"/>\n'
+        f'<path fill="{fill}" fill-rule="evenodd" d="{" ".join(subs)}"/>\n'
         "</svg>\n"
     )
     return svg, subs, (mx0, my0, mx1, my1)
@@ -300,22 +501,60 @@ def svg_viewbox(svg_text):
 
 
 def evaluate(src, y0, y1, x0, x1, invert, upscale, turdsize, alphamax,
-             opttolerance, threshold=128):
-    """描摹后光栅化回**源像素网格**，与该区域二值掩膜比对，得到保真指标。"""
-    fg = region_mask(src, y0, y1, x0, x1, invert, upscale, threshold)
+             opttolerance, threshold=128, gray=None, ink_level=None):
+    """描摹后光栅化回**源像素网格**，与该区域二值掩膜比对，得到保真指标。
+
+    返回两套分数，**用途完全不同**：
+
+    `iou` / `recall` / `precision`
+        描摹结果与"源图按 **128** 二值化"的掩膜比。注意这里的参考**固定 128**，
+        与候选阈值无关，所以它天然偏向 128——**不能用它选阈值**（会一路选中
+        128，把细笔画切碎）。留着是为了和历次报告口径一致。
+
+    `soft`
+        描摹结果（超采样覆盖率 0..1）与**源图覆盖率**（由灰度线性反推）的
+        软 IoU。这是选阈值的依据：它用上了抗锯齿携带的亚像素信息，而不是
+        把信息在二值化那一步丢掉。
+
+    为什么必须用 `soft` 选阈值（实测，`www.daiion.com` 1.36mm 高）：
+    源图是 145dpi，这行字只有 7.5px 高、笔画 1px。按 `iou` 选出的阈值 128
+    把 `w` 的斜画切成碎片，渲染出来是 `ʍʍʍ dai ɔn com`；按 `soft` 选出 148
+    （≈ 覆盖率 50% 的等值线）则笔画连通、可读。两者分数还正好相反：
+    128 的 `iou` 最高（82.6%）而 `soft` 只有 59.4%，148 的 `soft` 最高（73.0%）。
+    """
+    fg = region_mask(src, y0, y1, x0, x1, invert, upscale, threshold, gray)
     svg, subs, _ = mask_to_svg(fg, src.mm_per_px / upscale, x0 * upscale,
                                y0 * upscale, turdsize, alphamax, opttolerance)
-    ref = region_mask(src, y0, y1, x0, x1, invert, 1)
+    ref = region_mask(src, y0, y1, x0, x1, invert, 1, gray=gray)
     vx, vy = svg_viewbox(svg)[:2]
     cov = rasterize(svg, x1 - x0, y1 - y0, 1.0 / src.mm_per_px,
                     vx - x0 * src.mm_per_px, vy - y0 * src.mm_per_px, ss=8)
     acc = cov >= 0.5                      # 超采样覆盖率过半即算墨迹
     inter, union = (acc & ref).sum(), (acc | ref).sum()
+
+    # -- 覆盖率软 IoU ------------------------------------------------------
+    # 源覆盖率与描摹覆盖率都在**原生源像素网格**上，无需重采样即可逐像素比。
+    g = gray if gray is not None else src.gray
+    sub = g[y0:y1, x0:x1].astype(np.float32)
+    if ink_level is None:
+        ink = sub[sub < 250]
+        ink_level = float(np.percentile(ink, 1)) if len(ink) else 0.0
+    if ink_level >= 254:
+        soft = 100.0 if not acc.any() else 0.0
+    else:
+        cov_src = np.clip((255.0 - sub) / (255.0 - ink_level), 0, 1)
+        lo = np.minimum(cov_src, cov).sum()
+        hi = np.maximum(cov_src, cov).sum()
+        soft = float(lo / hi * 100) if hi else 100.0
+
     return {
         "iou": round(inter / union * 100, 2) if union else 100.0,
         "recall": round(inter / ref.sum() * 100, 2) if ref.sum() else 100.0,
         "precision": round(inter / acc.sum() * 100, 2) if acc.sum() else 100.0,
         "ink_ratio": round(acc.sum() / ref.sum(), 3) if ref.sum() else 1.0,
+        "soft": round(soft, 2),
+        "ink_level": round(float(ink_level), 1),
+        "coverage50": round((float(ink_level) + 255.0) / 2, 1),
         "subpaths": len(subs),
         "svg": svg,
     }
@@ -355,17 +594,46 @@ def auto_regions(src, min_gap_px=12, min_ink_px=6, invert_bands=False):
 # ----------------------------------------------------------------------------
 
 
+def hex_rgb(spec):
+    """'#RRGGBB' 或 'RRGGBB' -> (r, g, b)。"""
+    c = str(spec).strip().lstrip("#")
+    if len(c) == 3:
+        c = "".join(ch * 2 for ch in c)
+    if len(c) != 6:
+        raise ValueError(f"颜色应为 #RRGGBB 或 #RGB，收到 {spec!r}")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
 def parse_region(spec):
-    """name:x0,y0,x1,y1[,invert]  ->  (name, dict)"""
+    """name:x0,y0,x1,y1[,invert][,#RRGGBB]  ->  (name, dict)
+
+    末尾可给一个颜色。多色设计稿**必须**给：该颜色既用来从彩色原图里
+    挑出"本区域只描这一色"的墨迹（Source.ink_gray），也决定导入
+    CorelDRAW 后的填充色。不给就退回"灰度阈值 + 默认深灰填充"的老行为。
+    """
     if ":" not in spec:
-        raise ValueError(f"区域格式应为 name:x0,y0,x1,y1[,invert]，收到 {spec!r}")
+        raise ValueError(f"区域格式应为 name:x0,y0,x1,y1[,invert][,#RRGGBB]，"
+                         f"收到 {spec!r}")
     name, rest = spec.split(":", 1)
     parts = [p.strip() for p in rest.split(",")]
     if len(parts) < 4:
         raise ValueError(f"区域 {name} 缺少坐标")
     d = {"x0": int(parts[0]), "y0": int(parts[1]),
          "x1": int(parts[2]), "y1": int(parts[3])}
-    d["invert"] = len(parts) > 4 and parts[4].lower() in ("1", "true", "invert", "yes")
+    d["invert"] = False
+    d["fill"] = None
+    for p in parts[4:]:
+        if not p:
+            continue
+        # 颜色一律要带 '#'：否则 '128' 这种三位数会被当成 #112288 的简写，
+        # 而它更可能是手滑写进来的数值。
+        if p.startswith("#"):
+            d["fill"] = hex_rgb(p)
+        elif p.lower() in ("1", "true", "invert", "yes"):
+            d["invert"] = True
+        else:
+            raise ValueError(f"区域 {name} 的第 5 段起只能是 invert 或 #RRGGBB，"
+                             f"收到 {p!r}")
     return name, d
 
 
@@ -379,8 +647,9 @@ def main(argv=None):
     ap.add_argument("--page-height", type=float, default=None,
                     help="页面高度（毫米）；省略则按图比例推导")
     ap.add_argument("--region", action="append", default=[],
-                    help="区域定义 name:x0,y0,x1,y1[,invert]，可重复。"
-                         "坐标是源图像素，左上原点")
+                    help="区域定义 name:x0,y0,x1,y1[,invert][,#RRGGBB]，可重复。"
+                         "坐标是源图像素，左上原点。**多色稿必须给颜色**："
+                         "同一块区域按两种颜色各写一条，即按色分层描摹")
     ap.add_argument("--auto", action="store_true",
                     help="自动按投影分割区域（--region 同时给出时以 --region 为准）")
     ap.add_argument("--out", default="svg", help="输出目录")
@@ -437,31 +706,53 @@ def main(argv=None):
 
     os.makedirs(args.out, exist_ok=True)
 
+    # 多色稿：把各区域声明的颜色汇成调色板，之后按色分离墨迹
+    palette = []
+    for _n, _d in regions:
+        c = _d.get("fill")
+        if c and tuple(c) not in palette:
+            palette.append(tuple(c))
+    if palette:
+        src.palette = palette
+        print("调色板 %d 色: %s" % (
+            len(palette), ", ".join("#%02X%02X%02X" % c for c in palette)))
+        print()
+
+    def gray_of(r):
+        return src.ink_gray(r["fill"]) if r.get("fill") else None
+
+    def ink_of(r):
+        return src.ink_level(r["fill"]) if r.get("fill") else None
+
     if args.probe:
         print("参数扫描（U=上采样，ts=turdsize 折算后，thr=二值化阈值，"
               "am=alphamax，ot=opttolerance）")
         print("注意：alphamax=0 会让 potrace 输出纯多边形（圆角变折线）。"
               "它的 IoU 可能最高但视觉最差，务必同时看「曲线段」列。")
+        print("排序依据是**软IoU**（覆盖率口径）而不是二值 IoU：二值 IoU 的参考"
+              "固定按 128 生成，天然偏向低阈值，会把 1px 细笔画切成碎片。")
         print(f"{'region':12s} {'U':>2s} {'ts':>5s} {'thr':>4s} {'am':>5s} "
-              f"{'ot':>5s} {'IoU%':>7s} {'召回%':>7s} {'精确%':>7s} "
+              f"{'ot':>5s} {'软IoU%':>7s} {'IoU%':>7s} {'召回%':>7s} {'精确%':>7s} "
               f"{'子路径':>6s} {'曲线段':>6s} {'面积比':>8s}")
         best = {}
         for name, r in regions:
             rows = []
             for U in (4, 8):
                 for ts0 in (2, 3):
-                    for thr in (112, 118, 128, 138, 148):
+                    for thr in (112, 128, 139, 148, 160, 172, 184):
                         for am in (0.8, 1.0):
                             for ot in (0.1,):
                                 ts = max(1, int(round(ts0 * U * U)))
                                 m = evaluate(src, r["y0"], r["y1"], r["x0"],
                                              r["x1"], r["invert"], U, ts, am, ot,
-                                             threshold=thr)
-                                rows.append((m["iou"], U, ts, thr, am, ot, m))
+                                             threshold=thr, gray=gray_of(r),
+                                             ink_level=ink_of(r))
+                                rows.append((m["soft"], U, ts, thr, am, ot, m))
             rows.sort(key=lambda t: -t[0])
-            for iou, U, ts, thr, am, ot, m in rows[:8]:
+            for soft, U, ts, thr, am, ot, m in rows[:8]:
                 print(f"{name:12s} {U:2d} {ts:5d} {thr:4d} {am:4.1f} {ot:5.2f} "
-                      f"{m['iou']:7.2f} {m['recall']:7.2f} "
+                      f"{m['soft']:7.2f} {m['iou']:7.2f} "
+                      f"{m['recall']:7.2f} "
                       f"{m['precision']:7.2f} {m['subpaths']:6d} "
                       f"{m['svg'].count('C'):6d} {m['ink_ratio']:8.3f}")
             # 只在能产生真实曲线的候选中选最优（排除 alphamax=0 的多边形退化）
@@ -469,8 +760,8 @@ def main(argv=None):
             best[name] = curved[0] if curved else rows[0]
             print()
         print("=== 各区域最优（已排除 alphamax=0 的多边形退化）===")
-        for name, (iou, U, ts, thr, am, ot, m) in best.items():
-            print(f"  {name:12s} IoU {iou:6.2f}%  面积比 {m['ink_ratio']:.3f}   "
+        for name, (soft, U, ts, thr, am, ot, m) in best.items():
+            print(f"  {name:12s} 软IoU {soft:6.2f}%  面积比 {m['ink_ratio']:.3f}   "
                   f"--upscale {U} --turdsize {max(1, ts // (U * U))} "
                   f"--threshold {thr} --alphamax {am} --opttolerance {ot}")
         with open(os.path.join(args.out, "best_params.json"), "w",
@@ -478,7 +769,8 @@ def main(argv=None):
             json.dump({k: {"upscale": v[1], "turdsize_source_px": max(1, v[2] // (v[1] ** 2)),
                            "turdsize_internal": v[2], "threshold": v[3],
                            "alphamax": v[4], "opttolerance": v[5],
-                           "iou": v[0], "ink_ratio": v[6]["ink_ratio"],
+                           "soft": v[0], "iou": v[6]["iou"],
+                           "ink_ratio": v[6]["ink_ratio"],
                            "curve_segments": v[6]["svg"].count("C")}
                        for k, v in best.items()},
                       f, ensure_ascii=False, indent=2)
@@ -502,14 +794,15 @@ def main(argv=None):
         if args.crop_left:
             x0 = max(x0, args.crop_left)
         fg = region_mask(src, y0, y1, x0, x1, r["invert"], args.upscale,
-                         args.threshold)
+                         args.threshold, gray_of(r))
         if not fg.any():
             print(f"{name:12s} 掩膜为空，跳过")
             continue
         ts = max(1, args.turdsize * args.upscale ** 2)   # 坑 6
+        fill = ("#%02X%02X%02X" % tuple(r["fill"])) if r.get("fill") else "#111111"
         svg, subs, (mx0, my0, mx1, my1) = mask_to_svg(
             fg, src.mm_per_px / args.upscale, x0 * args.upscale,
-            y0 * args.upscale, ts, args.alphamax, args.opttolerance)
+            y0 * args.upscale, ts, args.alphamax, args.opttolerance, fill=fill)
         path = os.path.join(args.out, f"{name}.svg")
         with open(path, "w", encoding="utf-8") as f:
             f.write(svg)
@@ -520,6 +813,7 @@ def main(argv=None):
             "invert": r["invert"],
             "source_box_px": [x0, y0, x1, y1],
             "subpaths": len(subs),
+            "fill": list(r["fill"]) if r.get("fill") else None,
         }
         print(f"{name:12s} {len(subs):6d}  {mx0:11.3f}..{mx1:11.3f}  "
               f"{my0:11.3f}..{my1:11.3f}  "
