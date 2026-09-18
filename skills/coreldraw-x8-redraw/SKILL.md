@@ -28,6 +28,12 @@ CorelDRAW 里画出来"——走下面的位图矢量化主线，一条命令跑
 > | 3 | `cdr_bitmap_to_cdr.py` | 描摹 **非文字块 + keep_trace 的文字区** |
 > | 4 | `cdr_text_live.py --apply` | 把 `convert` 的文字建成可编辑文本 |
 >
+> **这四步不用手工拼命令**，`scripts/cdr_pipeline.py` 已经串好了：
+>
+> ```text
+> python scripts\cdr_pipeline.py --image ref.png --page-width 210 --output out\panel.cdr
+> ```
+>
 > 关键是**第 3 步的描摹范围要包含 `keep_trace` 的文字区**。漏掉它，品牌字标、
 > 特殊符号就会整个从成品里消失（踩过：`daiion` 字标和 `4#` 都不见了）。
 > 而 `--scan-json` 挖除清单只能喂 `convert` 的，喂全量会把 `keep_trace` 的字标一起挖掉。
@@ -37,6 +43,8 @@ CorelDRAW 里画出来"——走下面的位图矢量化主线，一条命令跑
 > 强行套 Arial Bold（IoU 0.60）反而是降级。此时必须在报告里说明原因。
 
 ## 快速开始（一条命令）
+
+**图纸没有文字**（纯图形、图标、装饰）时，用主入口最省事：
 
 ```powershell
 python scripts\cdr_bitmap_to_cdr.py --image ref.png --page-width 210 --output out\ref.cdr
@@ -479,7 +487,39 @@ python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cd
 
 ## 附带脚本
 
-### 主入口（位图 → CDR）
+### ★ 四步流水线编排（图纸里有文字时用这个）
+
+`scripts/cdr_pipeline.py` —— **一条命令跑完"识别 → 判定 → 描摹 → 建活字"**。
+图纸里有文字时应该用它，而不是下面那个"整张描摹"的主入口。
+
+```text
+python scripts\cdr_pipeline.py --image ref.png --page-width 210 --output out\panel.cdr
+python scripts\cdr_pipeline.py --image ref.png --page-width 210 --output out\panel.cdr ^
+  --skip-scan --skip-judge          # 调描摹参数时复用前两步（判定最慢）
+python scripts\cdr_pipeline.py --image ref.png --page-width 210 --output out\panel.cdr ^
+  --skip-scan --skip-judge --skip-trace   # 只重建活字
+python scripts\cdr_pipeline.py --image ref.png --page-width 210 --output out\panel.cdr ^
+  --keep-trace                      # 全部保留描摹，只看识别结果
+```
+
+退出码：`0` 成功；`1` 参数/文件问题；`3` 目标 CDR 被占用且无法自动释放；
+其余为子步骤退出码透传。
+
+它保证两个**手工拼命令时最容易错**的不变量：
+
+1. **描摹范围 = 非文字块 + `keep_trace` 的文字区。** 漏掉后半句，品牌字标与
+   特殊符号会整个从成品里消失。
+2. **`--scan-json` 挖除清单只喂 `convert` 的条目。** 喂全量会把 `keep_trace`
+   的字标一起挖掉，等于主动删内容。
+
+另外它把两份格式不同的区域清单（活字 `NAME=y0,y1,x0,y1` / 描摹
+`name:x0,y0,x1,y1`）**从同一份 `scan.json` 派生**，不给人手抄的机会——
+手抄必然不同步。每次重写目标前也会自动调 `release_document()` 解除占用。
+
+> 主入口与编排脚本的分工：`cdr_bitmap_to_cdr.py` 是"整张描摹"，
+> 图纸**没有文字**时最省事；有文字就走 `cdr_pipeline.py`。
+
+### 主入口（位图 → CDR，无文字时最省事）
 
 `scripts/cdr_bitmap_to_cdr.py` —— 一条命令跑完全流程。参数见 `--help`。
 

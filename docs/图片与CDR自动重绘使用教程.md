@@ -79,7 +79,7 @@ xcopy /E /I skills\coreldraw-x8-redraw "%USERPROFILE%\.workbuddy-ai\skills\corel
 
 ### 5. 离线回归测试（可选）
 
-没装 CorelDRAW 也能验证技能自带的逻辑是否正确（196 项断言）：
+没装 CorelDRAW 也能验证技能自带的逻辑是否正确（204 项断言）：
 
 ```powershell
 python skills\coreldraw-x8-redraw\scripts\selftest_offline.py
@@ -1151,6 +1151,30 @@ X8 实测枚举：`cdrPortrait = 0`、`cdrLandscape = 1`。
 ---
 
 ## 八、脚本参数速查
+
+### cdr_pipeline.py（★ 四步流水线编排，图纸有文字时用这个）
+
+| 参数 | 说明 |
+| --- | --- |
+| `--image` | 源位图路径（必填） |
+| `--output` | 输出 CDR 路径（必填） |
+| `--page-width` | 页面宽度 mm（用于标定，与 `--mm-per-px` 二选一） |
+| `--page-size` | 标准纸型（A4/A3/…），透传给描摹步骤 |
+| `--mm-per-px` | 直接给标定比例；不给则按 `page_width / 图像宽` 推导 |
+| `--out-dir` | 中间产物目录，默认 `<CDR 同目录>/<文件名>_pipeline` |
+| `--live-color` | 活字默认颜色（逐区识别到颜色时以逐区为准） |
+| `--upscale` | 描摹上采样倍数，默认 8 |
+| `--keep-trace` | 全部文字保留描摹、不建活字（只想看识别结果时用） |
+| `--skip-scan` / `--skip-judge` / `--skip-trace` | 复用前序步骤的产物 |
+| `--allow-palette-mismatch` | 调色板与源图不符时仍继续（默认中止） |
+
+退出码：`0` 成功；`1` 参数/文件问题；`3` 目标 CDR 被占用且无法自动释放；
+其余为子步骤退出码透传。
+
+它替你保证两件手工拼命令时最容易错的事：**描摹范围含 `keep_trace` 的文字区**、
+**挖除清单只喂 `convert` 的条目**。另外两份格式不同的区域清单
+（活字 `NAME=y0,y1,x0,x1` / 描摹 `name:x0,y0,x1,y1`）从**同一份 `scan.json`**
+派生，不给手抄的机会——手抄必然不同步。
 
 ### cdr_scan_text.py（整图识别）
 

@@ -106,7 +106,7 @@ python skills\coreldraw-x8-redraw\scripts\cdr_bitmap_to_cdr.py ^
 | 易碎标 | 152.539,59.532..194.988,75.924 | 152.474,59.596..195.074,75.924 |
 | 页脚 | 81.274,186.878..145.292,189.121 | 81.252,186.921..145.249,189.703 |
 
-这套判据有**离线回归测试**（`scripts/selftest_offline.py`，196 项断言，不需要
+这套判据有**离线回归测试**（`scripts/selftest_offline.py`，204 项断言，不需要
 CorelDRAW）：用一张几何已知的合成图覆盖残留剥离、外沿外扩、贯通判据、
 行中位数、列切分、超采样度量等每一处坑，改坏了立刻报出来。
 
@@ -184,6 +184,13 @@ X8 内置 PowerTRACE 的宏接口**能跑**，但质量差一个量级，所以�
 > 2. cdr_text_live.py          逐区判定 convert / keep_trace（只判定，不写）
 > 3. cdr_bitmap_to_cdr.py      描摹【非文字块 + keep_trace 的文字区】
 > 4. cdr_text_live.py --apply  把 convert 的文字建成可编辑美术字
+> ```
+>
+> 四步已经串好，不用手工拼命令：
+>
+> ```powershell
+> python skills\coreldraw-x8-redraw\scripts\cdr_pipeline.py ^
+>   --image ref.png --page-width 210 --output out\panel.cdr
 > ```
 >
 > 第 3 步的范围**必须包含 `keep_trace` 的文字区**。漏掉它，品牌字标和特殊符号
@@ -415,7 +422,7 @@ python skills\coreldraw-x8-redraw\scripts\cdr_redraw.py ^
   --source input.cdr --output outputs\redraw_exact.cdr --mode clone
 ```
 
-**离线回归测试**（不需要 CorelDRAW，196 项断言）：
+**离线回归测试**（不需要 CorelDRAW，204 项断言）：
 
 ```powershell
 python skills\coreldraw-x8-redraw\scripts\selftest_offline.py
@@ -433,8 +440,9 @@ OCR 的预处理与变体选择（Otsu 平台期、二值化极性、变体选�
 skills/coreldraw-x8-redraw/
 ├── SKILL.md                          技能定义与完整流程
 ├── scripts/
-│   ├── cdr_bitmap_to_cdr.py          ★ 主入口：位图 → CDR 一条命令
-│   ├── cdr_scan_text.py              ★ 整图识别：文字/符号/图形块 + 文字朝向
+│   ├── cdr_pipeline.py               ★ 四步流水线编排（先识别文字，再描摹图形）
+│   ├── cdr_bitmap_to_cdr.py          主入口：位图 → CDR 一条命令（无文字时最省事）
+│   ├── cdr_scan_text.py              整图识别：文字/符号/图形块 + 文字朝向
 │   ├── cdr_image_trace.py            标定 + 分区 + 描摹 + 参数寻优
 │   ├── cdr_image_place.py            按清单在 CorelDRAW 中重建
 │   ├── cdr_visual_diff.py            配准式像素校验
@@ -442,7 +450,7 @@ skills/coreldraw-x8-redraw/
 │   ├── cdr_prompt_builder.py         生成文件专属重绘提示词
 │   ├── cdr_redraw.py                 形状级精确重建与结构校验
 │   ├── cdr_common.py                 COM 连接、重试、遍历、统计、占用释放
-│   └── selftest_offline.py           离线回归测试（196 项断言，含自动分区合成图、整图识别、活字判定、OCR 预处理、占用释放）
+│   └── selftest_offline.py           离线回归测试（204 项断言，含自动分区合成图、整图识别、活字判定、OCR 预处理、占用释放）
 └── references/
     ├── raster-to-vector-notes.md     ★ 位图矢量化必读（实测踩坑结论）
     │                                 §9 = 内置 PowerTRACE 完整实测

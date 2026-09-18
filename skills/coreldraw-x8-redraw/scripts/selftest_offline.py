@@ -790,6 +790,59 @@ def test_stat_sig(tmpdir):
           s3 == s2, f"{s2} -> {s3}")
 
 
+def test_pipeline_parse_live():
+    """编排脚本的区域清单解析 `cdr_pipeline.parse_live`。
+
+    这份格式和描摹用的那份**方向是反的**（活字 `NAME=y0,y1,x0,x1`、
+    描摹 `name:x0,y0,x1,y1`），是历史原因造成的。所以解析必须**按位置**
+    而不是按语义猜，否则两份清单会静默错位。
+
+    踩过的坑（与 `cdr_text_live.parse_region` 同源）：
+    - 3 位数字坐标（如 `635`）会被误当成 3 位简写色值 `#635`；
+    - `#` 在 shell 里被当注释剥掉后，颜色与 `rot=180` 一起丢失，
+      于是倒置文字没被转正、OCR 全 0。
+
+    这里测死契约：坐标恒取前 4 个字段、`#` 只在可选字段位置认色、
+    `rot=` 独立解析、非法声明必须抛错而不是静默吞掉。
+    """
+    import cdr_pipeline as P
+
+    _n, y0, y1, x0, x1, c, r = P.parse_live("www.daiion.com=276,300,332,585")
+    check("只给坐标时解析正确，且**第一个数就是 y0**（不是 x0）",
+          (y0, y1, x0, x1) == (276, 300, 332, 585), f"得到 {(y0, y1, x0, x1)}")
+    check("无颜色时 color 为 None、rot 为 0", c is None and r == 0,
+          f"得到 {(c, r)}")
+
+    _n2, y0, y1, x0, x1, c2, r2 = P.parse_live(
+        "t=67,93,813,843,#1A1819,rot=180")
+    check("颜色与 rot 同时解析出来",
+          (c2, r2) == ("#1A1819", 180), f"得到 {(c2, r2)}")
+    check("带可选字段时坐标不受影响",
+          (y0, y1, x0, x1) == (67, 93, 813, 843), f"得到 {(y0, y1, x0, x1)}")
+
+    # 3 位数字坐标不能被当成 3 位简写色值
+    _n3, y0, y1, x0, x1, c3, _r3 = P.parse_live("a=635,700,635,700")
+    check("3 位数字坐标不被误判成色值",
+          (y0, y1, x0, x1) == (635, 700, 635, 700) and c3 is None,
+          f"得到 {(y0, y1, x0, x1, c3)}")
+
+    # 只有 rot、没有颜色
+    _n4, *_rest, r4 = P.parse_live("b=10,20,30,40,rot=180")
+    check("只有 rot 时也能解析", r4 == 180, f"得到 {r4}")
+
+    try:
+        P.parse_live("W=1,2,3")
+        check("非法区域声明（坐标不足 4 个）必须抛错", False, "没有抛错")
+    except (ValueError, IndexError):
+        check("非法区域声明（坐标不足 4 个）必须抛错", True)
+
+    try:
+        P.parse_live("V=1,2,3,4,zzz")
+        check("无法识别的可选字段必须抛错（不能静默忽略）", False, "没有抛错")
+    except ValueError:
+        check("无法识别的可选字段必须抛错（不能静默忽略）", True)
+
+
 class _FakeDoc:
     """最小 Document 桩，只实现 release_document 用到的属性。"""
 
@@ -1441,6 +1494,8 @@ def main():
     test_case_by_height()
     print()
     test_parse_region_fields()
+    print()
+    test_pipeline_parse_live()
 
     print("\n=== G. 整图识别：调色板 / 分色 / 块 / 方向（合成图 + 纯逻辑）===")
     test_detect_palette()
