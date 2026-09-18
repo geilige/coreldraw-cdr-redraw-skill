@@ -812,5 +812,5 @@ IVGBitmap.Trace(TraceType, Smoothing, DetailLevelPercent, ColorMode, PaletteID,
 但简化参数需调优、视觉保真需验证，**目前未并入主流程**。
 
 > 另外一条路比"中心线瘦身"更彻底：**把文字识别出来、用最接近的字体重建成活字**。
-> 见 `references/live-text-design.md`——实测页脚能做到 IoU 0.7244、节点数从 840 段
-> 降到 1 个文本对象，而且**文字可编辑**。
+> 见 `references/live-text-design.md`——实测页脚能做到逐词对齐 IoU 0.7235、
+> 节点数从 840 段降到 1 个文本对象，而且**文字可编辑**。
