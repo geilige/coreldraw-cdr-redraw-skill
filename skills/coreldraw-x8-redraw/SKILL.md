@@ -237,7 +237,7 @@ python scripts\cdr_text_live.py --image 源图.png ^
 - `keep_trace` + `reject_kind=weak_match` → 保留轮廓，报告里列出库里最接近的候选；
 - `keep_trace` + `reject_kind=not_text` → **这块根本不是一行文字**，该去查区域切分。
 
-五个关键设计点（详见 `references/live-text-design.md`）：
+六个关键设计点（详见 `references/live-text-design.md`）：
 
 1. **OCR 必须二值化，而且不能按置信度选变体**。实测同一区域同一裁切框：
    喂原始灰度 **4 套变体全错**（`O.V.D.` 大小写错、词间空格被吃掉）；
@@ -259,6 +259,17 @@ python scripts\cdr_text_live.py --image 源图.png ^
 5. **易混符号直接量字形**（`•` 宽高比 1.25/密度 0.80 vs `-` 宽高比 4.00），
    大小写改动才走整体 IoU 逐词裁决——因为单个窄字形只占整行约 1% 面积，
    全局 IoU 分不出来。
+6. **`--replace-traced` 不是可选项，是必需项**。描摹轮廓与活字同位置，
+   叠加等于把这一行字**加粗一遍**（实测墨迹比 1.286 = 比源图粗 28.6%，
+   而单独描摹 1.046、单独活字 1.141）。转活字的意义是**替代**描摹。
+   删除时机：只在活字建好、且定位误差 ≤ 0.05mm 之后删。
+
+**⚠️ 保存必须核验落盘，不能只看"没报错"。** 真踩过：整轮跑完、内存里回读核验
+全对、日志打印"已保存"，重新打开文件发现改动**根本没进去**，白跑一轮还差点当成
+交付完成。根因是目标 CDR 被另一个进程打开（用户自己开着 CorelDRAW），文件只读，
+而 `doc.Save()` 在这种情况下**既不抛异常也不写文件**。所以保存前后各取一次
+`(大小, mtime_ns)` 指纹比对，没变就报错并以退出码 3 结束。
+**一般化教训：`调用没报错` ≠ `结果发生了`——跨进程落盘的写操作必须回读磁盘确认。**
 
 **⚠️ 验证时一定要用真正的源图**。早期"验证通过"跑在一个人工做的测试裁切上，
 那个裁切恰好是**二值图**（PIL mode `1`），所以看起来一切正常；
@@ -521,7 +532,7 @@ python scripts\cdr_redraw.py --source input.cdr --output outputs\redraw_exact.cd
 ```text
 python -m pip install numpy opencv-python pillow potracer
 python -m pip install pywin32          # 只有要建 CDR 时才需要
-python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线回归测试（110 项断言）
+python scripts\selftest_offline.py     # 无 CorelDRAW 环境的离线回归测试（115 项断言）
 ```
 
 文字转活字另需 OCR（离线，无需联网）：
@@ -546,15 +557,17 @@ Windows 上 `onnxruntime` 还缺 `vcruntime140_1.dll` 与 `msvcp140_1.dll`
 > 再确认依赖装在了哪个。**跑脚本时始终用装了依赖的那个绝对路径**，
 > 不要依赖 `PATH` 里的 `python`。
 
-`selftest_offline.py` 覆盖三块：纯逻辑（提示词渲染、CDR 结构比对）；
+`selftest_offline.py` 覆盖五块：纯逻辑（提示词渲染、CDR 结构比对）；
 **用一张几何已知的合成图**验证自动分区的每一处坑（残留剥离、外沿外扩、
 满版色带贯通判据、行中位数、列方向切分、超采样度量的偏差量级）；
-文字转活字的判定（连通分量、文字/线稿的统计特征、四条判据的边界），
-以及 OCR 的预处理与变体选择（Otsu 平台期、二值化极性、变体选择规则）。
+文字转活字的判定（连通分量、文字/线稿的统计特征、四条判据的边界）；
+OCR 的预处理与变体选择（Otsu 平台期、二值化极性、变体选择规则）；
+保存落盘核验的文件指纹（写了必须变、没写必须不变）。
 **夹具全部用实测值而不是编的数**——包括那张"置信度会选错"的变体表。
 
 改动 `auto_partition` / `strip_residue` / `_tighten` / `rasterize` /
-`cc_sizes` / `decide_convert` / `_otsu_gray` / `binarize` / `pick_variant`
+`cc_sizes` / `decide_convert` / `_otsu_gray` / `binarize` / `pick_variant` /
+`_stat_sig`
 之后**必须重跑它**——这些函数的错误在真实图上
 往往只表现为"某块内容描歪了""多了一行不该有的文字"，肉眼很难定位。
 

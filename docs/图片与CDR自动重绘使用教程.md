@@ -79,7 +79,7 @@ xcopy /E /I skills\coreldraw-x8-redraw "%USERPROFILE%\.workbuddy-ai\skills\corel
 
 ### 5. 离线回归测试（可选）
 
-没装 CorelDRAW 也能验证技能自带的逻辑是否正确（110 项断言）：
+没装 CorelDRAW 也能验证技能自带的逻辑是否正确（115 项断言）：
 
 ```powershell
 python skills\coreldraw-x8-redraw\scripts\selftest_offline.py

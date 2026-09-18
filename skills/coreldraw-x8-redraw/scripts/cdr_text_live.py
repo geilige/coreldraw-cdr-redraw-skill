@@ -878,6 +878,21 @@ def apply_region(app, page, rec, mm_per_px, layer_suffix, rgb, log=print):
             'max_error_mm': max(err) if err else None}
 
 
+def _stat_sig(path):
+    """文件的 `(大小, mtime_ns)` 指纹，用来判断一次保存**是否真的落盘**。
+
+    返回 `(None, None)` 表示文件还不存在（新建文档时是正常情况）。
+
+    存在的意义：跨进程写文件时，"调用没报错"完全不代表"内容写进去了"。
+    CDR 被别的程序打开时 `doc.Save()` 会静默变成空操作，只看日志是发现不了的。
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return (None, None)
+    return (st.st_size, st.st_mtime_ns)
+
+
 def _parse_replace(specs):
     """解析 `--replace-traced` 的 `REGION=LAYER`（可重复）。"""
     out = {}
@@ -1015,13 +1030,39 @@ def apply_all(args, summary, log=print):
                                   if r['replaced']['ok']
                                   else r['replaced']['error']))
 
+    # 保存，并**核验真的落盘**。
+    #
+    # 为什么必须核验：目标 CDR 被另一个进程打开时（最典型的就是用户自己开着
+    # CorelDRAW 在看这个文件），文件是**只读**的，而 `doc.Save()` 在这种情况下
+    # 既不抛异常、也不写文件——日志照样打印"已保存"，磁盘上却还是旧内容。
+    #
+    # 这个坑真踩过：转活字整轮跑完、内存里回读核验全对、日志打印"已保存"，
+    # 结果重新打开文件发现 `05_TEXT` 还在、活字根本没有，白跑一轮还差点当成
+    # 交付完成。**"调用没报错"不等于"结果发生了"**，凡是跨进程落盘的写操作
+    # 都要回读磁盘确认。
+    #
+    # 判据用 (大小, mtime_ns) 是否变化：便宜且足够——真写了必然变。
+    save_ok = True
+    before = _stat_sig(target)
     try:
         C.release_optimization(app)
         doc.Save()
-        log()
-        log('已保存 %s' % target)
     except Exception as e:
         log('保存失败: %s' % e)
+        save_ok = False
+    else:
+        after = _stat_sig(target)
+        if after == before:
+            log()
+            log('[失败] 保存没有落盘：%s 的大小与修改时间都没变。' % target)
+            log('       文件多半正被另一个程序打开（比如 CorelDRAW），处于只读状态。')
+            log('       请关闭该文件后重跑——本轮改动只在内存里，没有写进文件。')
+            save_ok = False
+        else:
+            log()
+            log('已保存 %s（%s → %s 字节）'
+                % (target, before[0] if before[0] is not None else '新建',
+                   after[0]))
 
     # 回读核验：形状类型必须是 cdrTextShape(6)
     log()
@@ -1049,7 +1090,7 @@ def apply_all(args, summary, log=print):
     if skipped:
         log()
         log('以下区域未转活字（保留描摹轮廓）：%s' % ', '.join(skipped))
-    return 0
+    return 0 if save_ok else 3
 
 
 # --------------------------------------------------------------------------

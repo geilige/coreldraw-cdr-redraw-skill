@@ -18,6 +18,14 @@ C. 文字转活字的判定（纯逻辑，不需要 OCR、不需要 CorelDRAW）
    - decide_convert    四条判据，**用实测的两个案例当夹具**
                        （真页脚 n_cc=53/n_char=48；把插图区当文字区 n_cc=66/n_char=6）
 
+D. OCR 预处理与变体选择（纯逻辑）
+   - _otsu_gray        双峰图必须取平台中点，否则二值图全白
+   - binarize          反白字的极性保护
+   - pick_variant      用列投影词数选变体，**不能按置信度选**
+
+E. 保存落盘核验（纯逻辑）
+   - _stat_sig         判断"保存有没有真的写进文件"
+
 合成图是刻意设计的，每一处都对应一个真实踩过的坑：
 左侧 4 列 + 顶部 3 行贯穿残留、满版色带被反白字掏空、同一行两个内容块、
 细笔画文字带一圈比二值化阈值更浅的抗锯齿外沿。
@@ -31,6 +39,7 @@ C. 文字转活字的判定（纯逻辑，不需要 OCR、不需要 CorelDRAW）
 import os
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -671,6 +680,40 @@ def test_pick_variant():
           L.pick_variant([V('only', 0.5, 9, 48, 0)])['variant'] == 'only')
 
 
+def test_stat_sig(tmpdir):
+    """保存落盘核验用的文件指纹 `(大小, mtime_ns)`。
+
+    这是判断"保存到底有没有写进去"的**唯一判据**，契约要测死：
+    - 文件不存在 → `(None, None)`（新建文档时是正常情况，不能当成失败）
+    - 文件存在 → 大小正确
+    - **写了必须变**，**没写必须不变** —— 少任何一半，核验都会失去意义
+
+    动机是一次真实事故：目标 CDR 被另一个进程打开成只读时，`doc.Save()`
+    既不抛异常也不写文件，日志照样打印"已保存"，盘上却还是旧内容。
+    当时整轮跑完、回读核验全对，差点当成交付完成。
+    """
+    p = os.path.join(tmpdir, 'sig.txt')
+
+    check("文件不存在时返回 (None, None)，且不抛异常",
+          L._stat_sig(p) == (None, None))
+
+    with open(p, 'w') as f:
+        f.write('abc')
+    s1 = L._stat_sig(p)
+    check("文件存在时大小正确", s1[0] == 3, f"得到 {s1[0]}")
+    check("mtime_ns 已填充", isinstance(s1[1], int) and s1[1] > 0, f"得到 {s1[1]}")
+
+    time.sleep(0.01)
+    with open(p, 'w') as f:
+        f.write('abcdef')
+    s2 = L._stat_sig(p)
+    check("真的写入后指纹必须变（否则漏报）", s2 != s1, f"{s1} -> {s2}")
+
+    s3 = L._stat_sig(p)
+    check("没有写入时指纹保持不变（否则核验形同虚设，抓不到\"没落盘\"）",
+          s3 == s2, f"{s2} -> {s3}")
+
+
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
@@ -710,6 +753,10 @@ def main():
     test_binarize_polarity()
     print()
     test_pick_variant()
+
+    print("\n=== E. 保存落盘核验（纯逻辑）===")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_stat_sig(tmpdir)
 
     print()
     if _FAILED:
